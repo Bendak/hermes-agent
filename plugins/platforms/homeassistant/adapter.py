@@ -78,17 +78,110 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         self._listen_task: Optional[asyncio.Task] = None
         self._msg_id: int = 0
         extra = config.extra or {}
+
         # URL is scoped like the token below: a secondary's HASS_TOKEN must never be posted to the
         # DEFAULT profile's HA instance (os.environ under multiplex).
         self._hass_url: str = (extra.get("url") or _get_scoped_secret("HASS_URL", "http://homeassistant.local:8123")).rstrip("/")
         self._hass_token: str = config.token or _get_scoped_secret("HASS_TOKEN", "")
-        self._watch_domains: Set[str] = set(extra.get("watch_domains", []))
-        self._watch_entities: Set[str] = set(extra.get("watch_entities", []))
+
+        # Event filtering
+        self._watch_domains: Set[str] = set()
+        self._watch_entities: Set[str] = set()
         self._ignore_entities: Set[str] = set(extra.get("ignore_entities", []))
         self._watch_all: bool = bool(extra.get("watch_all", False))
         self._cooldown_seconds: int = int(extra.get("cooldown_seconds", 30))
-        self._last_event_time: Dict[str, float] = {}  # entity_id -> last event ts
 
+        # Deliver target overrides (issue #35060)
+        # Per-entry override keyed by entity_id or domain name.
+        self._deliver_overrides: Dict[str, str] = {}
+        # Default deliver target: "homeassistant" unless overridden top-level.
+        self._default_deliver: str = "homeassistant"
+
+        # Parse watch_entities — plain strings and dict-form entries
+        for entry in (extra.get("watch_entities") or []):
+            if isinstance(entry, str):
+                self._watch_entities.add(entry)
+            elif isinstance(entry, dict):
+                if len(entry) != 1:
+                    logger.warning(
+                        "[%s] Malformed watch_entities entry (dict with != 1 key): %s, skipping",
+                        self.name, entry,
+                    )
+                    continue
+                entity_id, cfg = next(iter(entry.items()))
+                if not isinstance(entity_id, str):
+                    logger.warning(
+                        "[%s] Malformed watch_entities entry (non-string key): %s, skipping",
+                        self.name, entry,
+                    )
+                    continue
+                self._watch_entities.add(entity_id)
+                if isinstance(cfg, dict) and "deliver" in cfg:
+                    dv = cfg["deliver"]
+                    if isinstance(dv, str):
+                        self._deliver_overrides[entity_id] = dv
+                    else:
+                        logger.warning(
+                            "[%s] Malformed watch_entities entry (deliver not str): %s, skipping deliver target",
+                            self.name, entry,
+                        )
+                elif not isinstance(cfg, dict):
+                    logger.warning(
+                        "[%s] Malformed watch_entities entry (config not a dict): %s, ignoring deliver target",
+                        self.name, entry,
+                    )
+            else:
+                logger.warning(
+                    "[%s] Malformed watch_entities entry (not str or dict): %s, skipping",
+                    self.name, entry,
+                )
+
+        # Parse watch_domains — plain strings and dict-form entries
+        for entry in (extra.get("watch_domains") or []):
+            if isinstance(entry, str):
+                self._watch_domains.add(entry)
+            elif isinstance(entry, dict):
+                if len(entry) != 1:
+                    logger.warning(
+                        "[%s] Malformed watch_domains entry (dict with != 1 key): %s, skipping",
+                        self.name, entry,
+                    )
+                    continue
+                domain, cfg = next(iter(entry.items()))
+                if not isinstance(domain, str):
+                    logger.warning(
+                        "[%s] Malformed watch_domains entry (non-string key): %s, skipping",
+                        self.name, entry,
+                    )
+                    continue
+                self._watch_domains.add(domain)
+                if isinstance(cfg, dict) and "deliver" in cfg:
+                    dv = cfg["deliver"]
+                    if isinstance(dv, str):
+                        self._deliver_overrides[domain] = dv
+                    else:
+                        logger.warning(
+                            "[%s] Malformed watch_domains entry (deliver not str): %s, skipping deliver target",
+                            self.name, entry,
+                        )
+                elif not isinstance(cfg, dict):
+                    logger.warning(
+                        "[%s] Malformed watch_domains entry (config not a dict): %s, ignoring deliver target",
+                        self.name, entry,
+                    )
+            else:
+                logger.warning(
+                    "[%s] Malformed watch_domains entry (not str or dict): %s, skipping",
+                    self.name, entry,
+                )
+
+        # Top-level default deliver target
+        top_deliver = extra.get("deliver") or extra.get("default_deliver")
+        if isinstance(top_deliver, str):
+            self._default_deliver = top_deliver
+
+        # Cooldown tracking: entity_id -> last_event_timestamp
+        self._last_event_time: Dict[str, float] = {}
     def _next_id(self) -> int:
         self._msg_id += 1
         return self._msg_id
@@ -97,8 +190,22 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     def _new_session() -> "aiohttp.ClientSession":
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
 
-    # -- Connection lifecycle -----------------------------------------------
+    def resolve_deliver_target(self, entity_id: str) -> str:
+        """Resolve the deliver target platform for a watched entity.
 
+        Precedence: per-entry override (entity_id, then its domain) in
+        ``_deliver_overrides``, else the top-level default (``_default_deliver``,
+        itself "homeassistant" when unset). Pure resolution — no routing or
+        I/O happens here; the routing layer calls this to pick the platform.
+        """
+        if entity_id in self._deliver_overrides:
+            return self._deliver_overrides[entity_id]
+        domain = _domain_of(entity_id)
+        if domain in self._deliver_overrides:
+            return self._deliver_overrides[domain]
+        return self._default_deliver
+
+    # -- Connection lifecycle -----------------------------------------------
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to HA WebSocket API and subscribe to events."""
         if not AIOHTTP_AVAILABLE:
@@ -239,8 +346,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             entity_id, event_data.get("old_state", {}), event_data.get("new_state", {}))
         if not message:
             return
+        # Resolve cross-platform deliver target (issue #35060)
+        target = self.resolve_deliver_target(entity_id)
+        _chat_id = f"ha_events:{target}" if target != "homeassistant" else "ha_events"
+
+        # Build MessageEvent and forward to handler
         source = self.build_source(
-            chat_id="ha_events", chat_name="Home Assistant Events", chat_type="channel",
+            chat_id=_chat_id, chat_name="Home Assistant Events", chat_type="channel",
             user_id="homeassistant", user_name="Home Assistant")
         await self.handle_message(MessageEvent(
             text=message, message_type=MessageType.TEXT, source=source,
@@ -268,10 +380,77 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """Send a notification via HA REST API (persistent_notification.create).
+        """Send a notification via HA REST API (persistent_notification.create),
+        or route cross-platform when chat_id carries the ``ha_events:<target>`` tag.
 
         REST rather than the WebSocket, to avoid racing the listener loop that
         reads from the same WS connection.
+        """
+        # Cross-platform routing for tagged chat_ids (issue #35060)
+        if chat_id and chat_id.startswith("ha_events:"):
+            platform_name = chat_id.split(":", 1)[1]
+            if not platform_name:
+                return await self._send_ha_notification(content)
+            if not self.gateway_runner:
+                logger.warning(
+                    "[%s] No gateway runner for cross-platform delivery to '%s'; "
+                    "falling back to HA notification",
+                    self.name, platform_name,
+                )
+                return await self._send_ha_notification(content)
+            try:
+                target_platform = Platform(platform_name)
+            except ValueError:
+                logger.warning(
+                    "[%s] Unknown deliver platform '%s'; "
+                    "falling back to HA notification",
+                    self.name, platform_name,
+                )
+                return await self._send_ha_notification(content)
+
+            # Resolve target adapter (primary + profile fallback, mirroring webhook)
+            adapter = self.gateway_runner.adapters.get(target_platform)
+            if not adapter:
+                for _prof, amap in (
+                    getattr(self.gateway_runner, "_profile_adapters", None) or {}
+                ).items():
+                    if not isinstance(amap, dict):
+                        continue
+                    cand = amap.get(target_platform)
+                    if cand is not None:
+                        adapter = cand
+                        break
+
+            if not adapter:
+                logger.warning(
+                    "[%s] Adapter '%s' not connected; "
+                    "falling back to HA notification",
+                    self.name, platform_name,
+                )
+                return await self._send_ha_notification(content)
+
+            # Resolve home channel for the target platform
+            home = self.gateway_runner.config.get_home_channel(target_platform)
+            if not home or not getattr(home, "chat_id", None):
+                logger.warning(
+                    "[%s] No home channel for platform '%s'; "
+                    "falling back to HA notification",
+                    self.name, platform_name,
+                )
+                return await self._send_ha_notification(content)
+
+            return await adapter.send(home.chat_id, content, metadata=metadata)
+
+        # Local HA notification delivery (or fallback after routing failure)
+        return await self._send_ha_notification(content)
+
+    async def _send_ha_notification(self, content: str) -> SendResult:
+        """Send a notification via HA REST API (persistent_notification.create).
+
+        Used directly for local delivery and as the fallback for cross-platform
+        routing.  The REST API is used instead of WebSocket to avoid a race
+        condition with the event listener loop that reads from the same WS
+        connection.
         """
         url = f"{self._hass_url}/api/services/persistent_notification/create"
         payload = {"title": "Hermes Agent", "message": content[:self.MAX_MESSAGE_LENGTH]}

@@ -19,6 +19,7 @@ from plugins.platforms.homeassistant.adapter import (
     check_ha_requirements,
     validate_ha_config,
 )
+from gateway.platforms.base import SendResult
 
 
 # ---------------------------------------------------------------------------
@@ -317,4 +318,412 @@ class TestWsUrlConstruction:
         adapter = HomeAssistantAdapter(config)
         ws_url = adapter._hass_url.replace("http://", "ws://").replace("https://", "wss://")
         assert ws_url == "ws://ha:8123"
+
+
+# ---------------------------------------------------------------------------
+# Deliver target config parsing (issue #35060)
+# ---------------------------------------------------------------------------
+
+
+def _make_deliver_adapter(**extra) -> HomeAssistantAdapter:
+    """Helper: instantiate adapter with no network, for deliver tests."""
+    config = PlatformConfig(enabled=True, token="tok", extra=extra)
+    return HomeAssistantAdapter(config)
+
+
+class TestDeliverTargetParsing:
+    """Configurable deliver-target parsing for HA watch config.
+
+    watch_entities and watch_domains entries accept either a plain string
+    (unchanged behavior) or a single-entry dict {entity_or_domain: {"deliver": "<platform>"}}.
+    Also reads optional top-level "deliver" / "default_deliver" as the default.
+    Precedence: per-entry deliver > top-level deliver > "homeassistant".
+    """
+
+    # -- plain-string entries -------------------------------------------------
+
+    def test_plain_string_entities_default_to_homeassistant(self):
+        """Plain-string watch_entities entries resolve to 'homeassistant'."""
+        adapter = _make_deliver_adapter(
+            watch_entities=["sensor.temp", "light.bedroom"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "homeassistant"
+        assert adapter.resolve_deliver_target("light.bedroom") == "homeassistant"
+
+    def test_plain_string_domains_default_to_homeassistant(self):
+        """Plain-string watch_domains entries resolve to 'homeassistant'."""
+        adapter = _make_deliver_adapter(
+            watch_domains=["climate", "binary_sensor"],
+        )
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+        assert adapter.resolve_deliver_target("binary_sensor.motion") == "homeassistant"
+
+    # -- dict-form entries ----------------------------------------------------
+
+    def test_dict_form_entity_resolves_per_entity(self):
+        """Dict-form watch_entities entry sets deliver target per entity."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[{"sensor.temp": {"deliver": "whatsapp"}}],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "whatsapp"
+        # Other entities still default to "homeassistant"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+
+    def test_dict_form_domain_resolves_by_domain(self):
+        """Dict-form watch_domains entry sets deliver target for any entity in that domain."""
+        adapter = _make_deliver_adapter(
+            watch_domains=[{"climate": {"deliver": "telegram"}}],
+        )
+        assert adapter.resolve_deliver_target("climate.thermostat") == "telegram"
+        assert adapter.resolve_deliver_target("climate.ac") == "telegram"
+        # Unknown domain defaults
+        assert adapter.resolve_deliver_target("light.bedroom") == "homeassistant"
+
+    # -- top-level deliver / default_deliver ----------------------------------
+
+    def test_top_level_deliver_sets_default(self):
+        """Top-level 'deliver' key sets the default deliver target for all watch items."""
+        adapter = _make_deliver_adapter(
+            deliver="telegram",
+            watch_entities=["sensor.temp", "light.bedroom"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "telegram"
+        assert adapter.resolve_deliver_target("light.bedroom") == "telegram"
+
+    def test_default_deliver_alias_sets_default(self):
+        """Top-level 'default_deliver' alias sets the default deliver target."""
+        adapter = _make_deliver_adapter(
+            default_deliver="slack",
+            watch_entities=["sensor.temp"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "slack"
+
+    # -- precedence -----------------------------------------------------------
+
+    def test_per_entry_overrides_top_level_deliver(self):
+        """Per-entry deliver target overrides the top-level default."""
+        adapter = _make_deliver_adapter(
+            deliver="slack",
+            watch_entities=[{"sensor.temp": {"deliver": "whatsapp"}}],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "whatsapp"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "slack"
+
+    def test_top_level_deliver_overrides_implicit_default(self):
+        """Top-level deliver overrides the implicit 'homeassistant' default."""
+        adapter = _make_deliver_adapter(
+            deliver="discord",
+            watch_entities=["sensor.temp"],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "discord"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "discord"
+
+    # -- malformed entries ----------------------------------------------------
+
+    def test_malformed_entry_dict_with_multiple_keys_skipped(self, caplog):
+        """Dict with >1 key is skipped with a warning."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[{"sensor.temp": {"deliver": "whatsapp"}, "extra": "bad"}],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "homeassistant"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+        assert "Malformed" in caplog.text or "skipping" in caplog.text
+
+    def test_malformed_entry_deliver_not_str_skipped(self, caplog):
+        """Dict-form entry with non-string deliver value is skipped with a warning."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[{"sensor.temp": {"deliver": 123}}],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.temp") == "homeassistant"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+        assert "Malformed" in caplog.text or "skipping" in caplog.text
+
+    def test_malformed_entry_non_str_non_dict_skipped(self, caplog):
+        """Entry that is neither str nor dict is skipped with a warning."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[42, "sensor.valid"],
+            watch_domains=["climate"],
+        )
+        assert adapter.resolve_deliver_target("sensor.valid") == "homeassistant"
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+        assert "Malformed" in caplog.text or "skipping" in caplog.text
+
+    def test_malformed_entries_dont_break_startup(self):
+        """Multiple malformed entries don't raise at startup."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[
+                {"sensor.a": {"deliver": "whatsapp", "extra": "bad"}},
+                {"sensor.b": {"deliver": 123}},
+                42,
+                "sensor.valid",
+            ],
+            watch_domains=[{"climate.ac": {"deliver": "telegram"}}],
+        )
+        # The adapter should be constructable and queryable
+        assert adapter.resolve_deliver_target("sensor.valid") == "homeassistant"
+
+    # -- resolve_deliver_target interface -------------------------------------
+
+    def test_resolve_deliver_target_unknown_entity_uses_default(self):
+        """Entity not in any watch list still resolves to the default deliver target."""
+        adapter = _make_deliver_adapter(
+            deliver="telegram",
+            watch_entities=["sensor.temp"],
+            watch_domains=["climate"],
+        )
+        # Unknown entity - not watched, but resolve_deliver_target still returns default
+        assert adapter.resolve_deliver_target("light.unknown") == "telegram"
+
+    # -- M2: null-safe parsing and dotless id --------------------------------
+
+    def test_watch_config_none_does_not_crash(self):
+        """Extra with watch_entities=None and watch_domains=None does not crash at construction."""
+        adapter = _make_deliver_adapter(watch_entities=None, watch_domains=None)
+        assert adapter._watch_entities == set()
+        assert adapter._watch_domains == set()
+
+    def test_resolve_deliver_target_dotless_id_falls_through(self):
+        """resolve_deliver_target with a dotless id falls through to domain lookup / default."""
+        adapter = _make_deliver_adapter()
+        # "climate" has no dot, no overrides exist — falls through to default
+        assert adapter.resolve_deliver_target("climate") == "homeassistant"
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform delivery routing in send() (issue #35060)
+# ---------------------------------------------------------------------------
+
+
+class TestDeliverRouting:
+    """send() routes cross-platform when chat_id uses the ha_events: prefix."""
+
+    @staticmethod
+    def _stub_adapter(send_result=None):
+        """Build a minimal stub adapter with async send()."""
+        stub = MagicMock()
+        if send_result is not None:
+            stub.send = AsyncMock(return_value=send_result)
+        else:
+            stub.send = AsyncMock(return_value=SendResult(success=True))
+        return stub
+
+    @staticmethod
+    def _make_ha_adapter(**extra) -> HomeAssistantAdapter:
+        config = PlatformConfig(enabled=True, token="tok", extra=extra)
+        adapter = HomeAssistantAdapter(config)
+        return adapter
+
+    def _stub_runner(self, target_platform, target_adapter=None, home_chat_id=None):
+        """Build a stub gateway runner that returns a target adapter."""
+        runner = MagicMock()
+        runner.adapters = {}
+        if target_adapter is not None:
+            runner.adapters[target_platform] = target_adapter
+        runner.config = MagicMock()
+
+        if home_chat_id is not None:
+
+            class _FakeHomeChannel:
+                chat_id = home_chat_id
+
+            runner.config.get_home_channel = MagicMock(return_value=_FakeHomeChannel())
+        else:
+            runner.config.get_home_channel = MagicMock(return_value=None)
+        # Ensure _profile_adapters is empty so the fallback is never hit spuriously
+        runner._profile_adapters = {}
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_send_routes_to_target_adapter_when_chat_id_has_prefix(self):
+        """send('ha_events:telegram', ...) routes to the telegram adapter."""
+        adapter = self._make_ha_adapter()
+        target_adapter = self._stub_adapter()
+        runner = self._stub_runner(
+            Platform.TELEGRAM, target_adapter=target_adapter, home_chat_id="chat_42"
+        )
+        adapter.gateway_runner = runner
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock()
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events:telegram", "hello from HA")
+
+        assert result.success is True
+        # Target adapter should have been called with the home channel's chat_id
+        target_adapter.send.assert_called_once_with("chat_42", "hello from HA", metadata=None)
+
+    @pytest.mark.asyncio
+    async def test_send_ha_events_no_prefix_stays_local(self):
+        """send('ha_events', ...) without colon suffix stays in HA notification path."""
+        adapter = self._make_ha_adapter()
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events", "direct notification")
+
+        assert result.success is True
+        # Verify HA REST API was called
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_ha_when_no_gateway_runner(self):
+        """send('ha_events:telegram', ...) falls back to HA notification when gateway_runner is None."""
+        adapter = self._make_ha_adapter()
+        # gateway_runner is None by default
+        assert adapter.gateway_runner is None
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events:telegram", "fallback content")
+
+        assert result.success is True
+        # HA notification path should have been used
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_ha_when_target_adapter_missing(self):
+        """send('ha_events:telegram', ...) falls back when target adapter is not connected."""
+        adapter = self._make_ha_adapter()
+        runner = self._stub_runner(Platform.TELEGRAM, target_adapter=None)
+        adapter.gateway_runner = runner
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events:telegram", "fallback content")
+
+        assert result.success is True
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_ha_when_no_home_channel(self):
+        """send('ha_events:telegram', ...) falls back when home channel is missing."""
+        adapter = self._make_ha_adapter()
+        target_adapter = self._stub_adapter()
+        runner = self._stub_runner(
+            Platform.TELEGRAM, target_adapter=target_adapter, home_chat_id=None
+        )
+        adapter.gateway_runner = runner
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events:telegram", "fallback content")
+
+        assert result.success is True
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_ha_when_unknown_platform(self):
+        """send('ha_events:unknown_platform', ...) falls back to HA notification."""
+        adapter = self._make_ha_adapter()
+        runner = self._stub_runner(None)  # No target registered at all
+        adapter.gateway_runner = runner
+
+        mock_session = MagicMock()
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="OK")
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+        mock_session.post = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("plugins.platforms.homeassistant.adapter.aiohttp") as mock_aiohttp:
+            mock_aiohttp.ClientSession = MagicMock(return_value=mock_session)
+            mock_aiohttp.ClientTimeout = lambda total: total
+
+            result = await adapter.send("ha_events:unknown_platform", "fallback content")
+
+        assert result.success is True
+        call_args = mock_session.post.call_args
+        assert "/api/services/persistent_notification/create" in call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_handle_ha_event_sets_tagged_chat_id_for_cross_platform(self):
+        """_handle_ha_event sets chat_id to ha_events:telegram when deliver target is telegram."""
+        adapter = self._make_ha_adapter(
+            watch_entities=[{"sensor.temp": {"deliver": "telegram"}}],
+            cooldown_seconds=0,
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_ha_event(
+            _make_event("sensor.temp", "22", "25",
+                        new_attrs={"friendly_name": "Temp Sensor", "unit_of_measurement": "C"})
+        )
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_id == "ha_events:telegram"
+
+    @pytest.mark.asyncio
+    async def test_handle_ha_event_leaves_default_chat_id_for_ha(self):
+        """_handle_ha_event keeps default chat_id when deliver target is homeassistant."""
+        adapter = self._make_ha_adapter(
+            watch_entities=["sensor.temp"],
+            cooldown_seconds=0,
+        )
+        adapter.handle_message = AsyncMock()
+        await adapter._handle_ha_event(
+            _make_event("sensor.temp", "22", "25",
+                        new_attrs={"friendly_name": "Temp Sensor", "unit_of_measurement": "C"})
+        )
+        adapter.handle_message.assert_called_once()
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert msg_event.source.chat_id == "ha_events"
 
