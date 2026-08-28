@@ -493,6 +493,17 @@ class TestDeliverTargetParsing:
         # "climate" has no dot, no overrides exist — falls through to default
         assert adapter.resolve_deliver_target("climate") == "homeassistant"
 
+    def test_resolve_deliver_target_entity_overrides_domain(self):
+        """When both an entity key and its domain key have overrides, the entity (most specific) wins."""
+        adapter = _make_deliver_adapter(
+            watch_entities=[{"sensor.camera": {"deliver": "signal"}}],
+            watch_domains=[{"sensor": {"deliver": "whatsapp"}}],
+        )
+        # Exact entity match beats the domain match
+        assert adapter.resolve_deliver_target("sensor.camera") == "signal"
+        # Sibling entities on the watched domain still use the domain override
+        assert adapter.resolve_deliver_target("sensor.motion") == "whatsapp"
+
 
 # ---------------------------------------------------------------------------
 # Cross-platform delivery routing in send() (issue #35060)
