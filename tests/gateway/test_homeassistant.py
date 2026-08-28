@@ -727,3 +727,53 @@ class TestDeliverRouting:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.source.chat_id == "ha_events"
 
+    @pytest.mark.asyncio
+    async def test_send_accepts_capitalized_platform_name(self):
+        """send('ha_events:Telegram', ...) normalizes case and routes correctly."""
+        adapter = self._make_ha_adapter()
+        target_adapter = self._stub_adapter()
+        runner = self._stub_runner(
+            Platform.TELEGRAM, target_adapter=target_adapter, home_chat_id="chat_42"
+        )
+        adapter.gateway_runner = runner
+
+        result = await adapter.send("ha_events:Telegram", "capitalized alert")
+
+        assert result.success is True
+        target_adapter.send.assert_called_once_with("chat_42", "capitalized alert", metadata=None)
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_ha_when_target_adapter_raises(self):
+        """A raise from the target adapter falls back to HA notification."""
+        adapter = self._make_ha_adapter()
+        target_adapter = self._stub_adapter()
+        target_adapter.send = AsyncMock(side_effect=RuntimeError("network exploded"))
+        runner = self._stub_runner(
+            Platform.TELEGRAM, target_adapter=target_adapter, home_chat_id="chat_42"
+        )
+        adapter.gateway_runner = runner
+
+        with patch(
+            "plugins.platforms.homeassistant.adapter.HomeAssistantAdapter._send_ha_notification",
+            new_callable=AsyncMock,
+            return_value=SendResult(success=True),
+        ) as mock_ha_fallback:
+            result = await adapter.send("ha_events:telegram", "fallback alert")
+
+        assert result.success is True
+        mock_ha_fallback.assert_awaited_once_with("fallback alert")
+
+    @pytest.mark.asyncio
+    async def test_send_resolves_profile_adapter_fallback(self):
+        """When the primary adapters map lacks the target, _profile_adapters is consulted."""
+        adapter = self._make_ha_adapter()
+        target_adapter = self._stub_adapter()
+        runner = self._stub_runner(Platform.TELEGRAM, target_adapter=None, home_chat_id="chat_42")
+        runner._profile_adapters = {"profile_1": {Platform.TELEGRAM: target_adapter}}
+        adapter.gateway_runner = runner
+
+        result = await adapter.send("ha_events:telegram", "profile alert")
+
+        assert result.success is True
+        target_adapter.send.assert_called_once_with("chat_42", "profile alert", metadata=None)
+

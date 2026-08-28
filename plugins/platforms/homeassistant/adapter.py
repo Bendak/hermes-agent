@@ -399,7 +399,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return await self._send_ha_notification(content)
             try:
-                target_platform = Platform(platform_name)
+                # Accept user-capitalized names ("WhatsApp", "Telegram") —
+                # Platform enum values are lowercase.
+                target_platform = Platform(platform_name.strip().lower())
             except ValueError:
                 logger.warning(
                     "[%s] Unknown deliver platform '%s'; "
@@ -439,7 +441,19 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return await self._send_ha_notification(content)
 
-            return await adapter.send(home.chat_id, content, metadata=metadata)
+            # Fail-safe: a raise from the target adapter must never escape
+            # send() — fall back to the HA notification instead of dropping
+            # the alert. (asyncio.CancelledError is BaseException in 3.8+,
+            # so cancellation still propagates.)
+            try:
+                return await adapter.send(home.chat_id, content, metadata=metadata)
+            except Exception as e:
+                logger.warning(
+                    "[%s] Cross-platform delivery to '%s' failed (%s); "
+                    "falling back to HA notification",
+                    self.name, platform_name, e,
+                )
+                return await self._send_ha_notification(content)
 
         # Local HA notification delivery (or fallback after routing failure)
         return await self._send_ha_notification(content)
