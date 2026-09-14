@@ -38,32 +38,14 @@ interface SessionLike {
   }
 }
 
-/** Strip CR/LF that Windows clipboard pastes leave on service-token secrets. */
-export function sanitizeRemoteHeaderValue(value: string): string {
-  return String(value || '')
-    .replace(/[\r\n]+/g, '')
-    .trim()
-}
-
-export function sanitizeRemoteHeaderMap(headers: Record<string, string> = {}): Record<string, string> {
-  const out: Record<string, string> = {}
-
-  for (const [name, value] of Object.entries(headers)) {
-    const clean = sanitizeRemoteHeaderValue(value)
-
-    if (name && clean) {
-      out[name] = clean
-    }
-  }
-
-  return out
-}
-
 /**
  * Header blocks that Chromium (login window, renderer WS) may attach to a
  * remote gateway request. Registry Connections are the live source; the v1
  * single-remote block is fallback. Longer base URLs win so a path-prefixed
  * gateway is not shadowed by its origin sibling.
+ *
+ * Values arrive already sanitized: decryptRemoteHeaders in main.ts strips
+ * CR/LF on the single decrypt funnel, so there is no second normalizer here.
  */
 export function collectRemoteHeaderSources(input: {
   connections?: RemoteHeaderSource[]
@@ -80,12 +62,12 @@ export function collectRemoteHeaderSources(input: {
       continue
     }
 
-    sources.push({ headers: sanitizeRemoteHeaderMap(connection.headers), url: connection.url })
+    sources.push({ headers: connection.headers, url: connection.url })
   }
 
   if (input.v1Remote?.url && input.v1Remote.headers && Object.keys(input.v1Remote.headers).length > 0) {
     sources.push({
-      headers: sanitizeRemoteHeaderMap(input.v1Remote.headers),
+      headers: input.v1Remote.headers,
       url: input.v1Remote.url
     })
   }
@@ -97,7 +79,7 @@ export function resolveRemoteRequestHeaders(
   requestUrl: string,
   options: { exactHeaders?: Record<string, string>; sources?: RemoteHeaderSource[] } = {}
 ): Record<string, string> {
-  const exact = sanitizeRemoteHeaderMap(options.exactHeaders || {})
+  const exact = options.exactHeaders || {}
 
   if (Object.keys(exact).length > 0) {
     return exact
@@ -108,10 +90,8 @@ export function resolveRemoteRequestHeaders(
       continue
     }
 
-    const headers = sanitizeRemoteHeaderMap(source.headers)
-
-    if (Object.keys(headers).length > 0 && remoteRequestMatchesBaseUrl(requestUrl, source.url)) {
-      return headers
+    if (Object.keys(source.headers).length > 0 && remoteRequestMatchesBaseUrl(requestUrl, source.url)) {
+      return source.headers
     }
   }
 
@@ -119,7 +99,7 @@ export function resolveRemoteRequestHeaders(
 }
 
 export function formatLoadUrlExtraHeaders(headers: Record<string, string> = {}): string {
-  return Object.entries(sanitizeRemoteHeaderMap(headers))
+  return Object.entries(headers)
     .map(([name, value]) => `${name}: ${value}`)
     .join('\n')
 }

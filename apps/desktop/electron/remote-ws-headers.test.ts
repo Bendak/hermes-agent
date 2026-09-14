@@ -173,17 +173,7 @@ describe('registry gateway WebSocket headers', () => {
 describe('OAuth login and registry extra headers', () => {
   it('applies Connections extra headers to /login, not only an exact WebSocket URL', () => {
     const sources = collectRemoteHeaderSources({
-      connections: [
-        { kind: 'local' },
-        {
-          kind: 'remote',
-          url: 'https://gateway.example',
-          headers: {
-            'CF-Access-Client-Id': 'client-id\r\n',
-            'CF-Access-Client-Secret': 'client-secret\r'
-          }
-        }
-      ],
+      connections: [{ kind: 'local' }, { kind: 'remote', url: 'https://gateway.example', headers: accessHeaders }],
       v1Remote: { url: 'https://other.example', headers: { 'CF-Access-Client-Id': 'v1-only' } }
     })
 
