@@ -4,6 +4,7 @@ Requires aiohttp, HASS_TOKEN (Long-Lived Access Token) and HASS_URL (default htt
 """
 
 import asyncio
+import dataclasses
 import json
 import logging
 import time
@@ -97,6 +98,23 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         # Default deliver target: "homeassistant" unless overridden top-level.
         self._default_deliver: str = "homeassistant"
 
+        # Delivery mode (issue #35060 follow-up): "broadcast" (default) sends the
+        # event to the target chat via adapter.send(); "session" injects it into the
+        # target chat's most recent session via the gateway's internal-event carrier
+        # (admit_internal_event), so the event lands in that session's history and
+        # triggers a full agent turn there. Per-entry dict form may set its own mode.
+        self._deliver_mode_overrides: Dict[str, str] = {}
+        top_mode = extra.get("deliver_mode")
+        if isinstance(top_mode, str) and top_mode.strip().lower() in ("broadcast", "session"):
+            self._default_deliver_mode: str = top_mode.strip().lower()
+        else:
+            self._default_deliver_mode: str = "broadcast"
+            if top_mode is not None:
+                logger.warning(
+                    "[%s] Invalid deliver_mode %r (expected 'broadcast' or 'session'); "
+                    "using 'broadcast'", self.name, top_mode,
+                )
+
         # Parse watch_entities — plain strings and dict-form entries
         for entry in (extra.get("watch_entities") or []):
             if isinstance(entry, str):
@@ -116,6 +134,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     )
                     continue
                 self._watch_entities.add(entity_id)
+                if isinstance(cfg, dict):
+                    _m = cfg.get("deliver_mode")
+                    if isinstance(_m, str) and _m.strip().lower() in ("broadcast", "session"):
+                        self._deliver_mode_overrides[entity_id] = _m.strip().lower()
+                    elif _m is not None:
+                        logger.warning(
+                            "[%s] Invalid deliver_mode %r for %s (expected 'broadcast' or 'session'); "
+                            "ignoring", self.name, _m, entity_id,
+                        )
                 if isinstance(cfg, dict) and "deliver" in cfg:
                     dv = cfg["deliver"]
                     if isinstance(dv, str):
@@ -155,6 +182,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     )
                     continue
                 self._watch_domains.add(domain)
+                if isinstance(cfg, dict):
+                    _m = cfg.get("deliver_mode")
+                    if isinstance(_m, str) and _m.strip().lower() in ("broadcast", "session"):
+                        self._deliver_mode_overrides[domain] = _m.strip().lower()
+                    elif _m is not None:
+                        logger.warning(
+                            "[%s] Invalid deliver_mode %r for domain %s (expected 'broadcast' or 'session'); "
+                            "ignoring", self.name, _m, domain,
+                        )
                 if isinstance(cfg, dict) and "deliver" in cfg:
                     dv = cfg["deliver"]
                     if isinstance(dv, str):
@@ -189,6 +225,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     @staticmethod
     def _new_session() -> "aiohttp.ClientSession":
         return aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), trust_env=gateway_trust_env())
+
+    def resolve_deliver_mode(self, entity_id: str) -> str:
+        """Resolve the delivery mode for a watched entity (issue #35060 follow-up).
+
+        Precedence mirrors ``resolve_deliver_target``: per-entry override
+        (entity_id, then its domain) in ``_deliver_mode_overrides``, else the
+        top-level default (``_default_deliver_mode``, "broadcast" when unset).
+        """
+        if entity_id in self._deliver_mode_overrides:
+            return self._deliver_mode_overrides[entity_id]
+        domain = _domain_of(entity_id) or entity_id
+        if domain in self._deliver_mode_overrides:
+            return self._deliver_mode_overrides[domain]
+        return self._default_deliver_mode
 
     def resolve_deliver_target(self, entity_id: str) -> str:
         """Resolve the deliver target platform for a watched entity.
@@ -346,9 +396,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             entity_id, event_data.get("old_state", {}), event_data.get("new_state", {}))
         if not message:
             return
-        # Resolve cross-platform deliver target (issue #35060)
+        # Resolve cross-platform deliver target + mode (issue #35060 follow-up).
+        # Tag format ``ha_events:<target>`` keeps the broadcast behavior of #96930;
+        # ``ha_events:<target>;session`` requests session-integrated delivery.
         target = self.resolve_deliver_target(entity_id)
-        _chat_id = f"ha_events:{target}" if target != "homeassistant" else "ha_events"
+        if target != "homeassistant":
+            mode = self.resolve_deliver_mode(entity_id)
+            _chat_id = f"ha_events:{target}" + (";session" if mode == "session" else "")
+        else:
+            _chat_id = "ha_events"
 
         # Build MessageEvent and forward to handler
         source = self.build_source(
@@ -386,9 +442,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         REST rather than the WebSocket, to avoid racing the listener loop that
         reads from the same WS connection.
         """
-        # Cross-platform routing for tagged chat_ids (issue #35060)
+        # Cross-platform routing for tagged chat_ids (issue #35060). Tag grammar:
+        # ``ha_events:<platform>[;session]`` — the optional ``;session`` suffix selects
+        # session-integrated delivery (#35060 follow-up) and is stripped before the
+        # platform name is resolved.
         if chat_id and chat_id.startswith("ha_events:"):
-            platform_name = chat_id.split(":", 1)[1]
+            _tag_body = chat_id.split(":", 1)[1]
+            platform_name = _tag_body.split(";")[0]
             if not platform_name:
                 return await self._send_ha_notification(content)
             if not self.gateway_runner:
@@ -434,6 +494,26 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return await self._send_ha_notification(content)
 
+            # Session-integrated delivery (issue #35060 follow-up): inject the event
+            # into the target chat's most recent live session via the gateway's
+            # internal-event carrier — the same mechanism background notifications
+            # and watcher wakes use (gateway/wake.py). The synthetic event carries
+            # internal=True (persisted as display_kind="internal_notification",
+            # bypasses user-authorization minting) and allow_gateway_control=False
+            # (event text can never resolve gateway commands / pending prompts —
+            # untrusted payload stays conversational). A full agent turn runs in
+            # the target session, so follow-ups there have the event in context.
+            # Fallback chain: injection → broadcast adapter.send() → HA notification.
+            session_mode = chat_id.endswith(";session")
+            if session_mode:
+                injected = await self._inject_into_target_session(
+                    adapter, target_platform, home, content, profile,
+                )
+                if injected is not None:
+                    return injected  # SendResult from the injection path
+
+            # Broadcast delivery (default #96930 behavior, and the fallback when
+            # session mode is off or injection was not possible).
             # Fail-safe: a raise from the target adapter must never escape
             # send() — fall back to the HA notification instead of dropping
             # the alert. (asyncio.CancelledError is BaseException in 3.8+,
@@ -450,6 +530,83 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         # Local HA notification delivery (or fallback after routing failure)
         return await self._send_ha_notification(content)
+
+    async def _inject_into_target_session(
+        self, adapter, target_platform: Platform, home, content: str, profile: Optional[str],
+    ):
+        """Inject *content* into the target chat's most recent live session.
+
+        Returns a successful :class:`SendResult` when the injection was accepted,
+        or ``None`` when the caller must fall back to broadcast delivery (no
+        prior session for the chat, store unavailable, authorization failed, or
+        the carrier rejected the event). Never raises — a session-mode delivery
+        must degrade, not drop the alert.
+        """
+        try:
+            store = getattr(self.gateway_runner, "session_store", None)
+            if store is None:
+                logger.warning(
+                    "[%s] Session store unavailable; falling back to broadcast",
+                    self.name,
+                )
+                return None
+            # Owner-only selection (issue #35060 follow-up): the most recent session
+            # entry for this platform+chat inside the adapter's own profile. No
+            # synthetic participant IDs are ever minted in build_session_key().
+            candidates = [
+                e for e in store.list_sessions()
+                if e.origin is not None
+                and getattr(e.origin, "platform", None) == target_platform
+                and getattr(e.origin, "chat_id", None) == home.chat_id
+            ]
+            if not candidates:
+                logger.info(
+                    "[%s] No prior session for platform '%s' chat '%s'; "
+                    "broadcasting without session integration",
+                    self.name, target_platform.value, home.chat_id,
+                )
+                return None
+            entry = max(candidates, key=lambda e: e.updated_at)
+            # Envelope: gateway-authored text, metadata only, no judgments.
+            wake_text = (
+                f"[Home Assistant] {content}\n"
+                "(cross-platform event delivery; reply here if action is needed)"
+            )
+            # Synthesize the internal event by hand: admit_internal_event's
+            # deliver_wake helper does not expose allow_gateway_control, and event
+            # text comes from outside the gateway, so it must stay conversational
+            # (run_inbound's plugin-injection events set the same pair).
+            from gateway.platforms.event import MessageEvent, MessageType
+            from gateway.wake import admit_internal_event
+            # Reuse the target session's own origin as the event source (run_inbound's
+            # plugin-injection events do the same) — copy it so the adapter never
+            # receives a mutable shared instance.
+            origin = entry.origin
+            if dataclasses.is_dataclass(origin) and not isinstance(origin, type):
+                origin = dataclasses.replace(origin)
+            synth_event = MessageEvent(
+                text=wake_text, message_type=MessageType.TEXT,
+                source=origin, internal=True,
+                allow_gateway_control=False,
+                metadata={
+                    "gateway_session_key": entry.session_key,
+                    "gateway_session_id": entry.session_id,
+                    "hermes_cross_platform_delivery": True,
+                },
+            )
+            await admit_internal_event(adapter, synth_event)
+            logger.info(
+                "[%s] Session-integrated delivery injected into %s",
+                self.name, entry.session_key,
+            )
+            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
+        except Exception as e:
+            logger.warning(
+                "[%s] Session-integrated delivery to '%s' failed (%s); "
+                "falling back to broadcast",
+                self.name, getattr(target_platform, "value", target_platform), e,
+            )
+            return None
 
     def _target_home_channel(self, platform: Platform, profile: Optional[str]):
         """Home channel for *platform* as seen by *profile* (the default's config when unset)."""
