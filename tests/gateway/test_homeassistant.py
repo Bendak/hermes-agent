@@ -331,6 +331,13 @@ def _make_deliver_adapter(**extra) -> HomeAssistantAdapter:
     return HomeAssistantAdapter(config)
 
 
+def _fake_home_channel(chat_id: str):
+    """Minimal stand-in for a GatewayConfig home-channel entry."""
+    home = MagicMock()
+    home.chat_id = chat_id
+    return home
+
+
 class TestDeliverTargetParsing:
     """Configurable deliver-target parsing for HA watch config.
 
@@ -545,8 +552,15 @@ class TestDeliverRouting:
             runner.config.get_home_channel = MagicMock(return_value=_FakeHomeChannel())
         else:
             runner.config.get_home_channel = MagicMock(return_value=None)
-        # Ensure _profile_adapters is empty so the fallback is never hit spuriously
         runner._profile_adapters = {}
+
+        def _authorization_adapter(platform, profile=None):
+            """Mirror GatewayAuthorizationMixin: own profile's map only, fail closed."""
+            if profile and profile != "default":
+                return (runner._profile_adapters or {}).get(profile, {}).get(platform)
+            return runner.adapters.get(platform)
+
+        runner._authorization_adapter = MagicMock(side_effect=_authorization_adapter)
         return runner
 
     @pytest.mark.asyncio
@@ -775,16 +789,81 @@ class TestDeliverRouting:
         mock_ha_fallback.assert_awaited_once_with("fallback alert")
 
     @pytest.mark.asyncio
-    async def test_send_resolves_profile_adapter_fallback(self):
-        """When the primary adapters map lacks the target, _profile_adapters is consulted."""
+    async def test_send_uses_own_profile_adapter_and_home_channel(self):
+        """A secondary profile delivers through ITS OWN adapter and ITS OWN home channel."""
         adapter = self._make_ha_adapter()
+        adapter._owner_profile = "profile_1"
         target_adapter = self._stub_adapter()
-        runner = self._stub_runner(Platform.TELEGRAM, target_adapter=None, home_chat_id="chat_42")
+        runner = self._stub_runner(Platform.TELEGRAM, target_adapter=None)
         runner._profile_adapters = {"profile_1": {Platform.TELEGRAM: target_adapter}}
         adapter.gateway_runner = runner
+        adapter._target_home_channel = MagicMock(return_value=_fake_home_channel("chat_42"))
 
         result = await adapter.send("ha_events:telegram", "profile alert")
 
         assert result.success is True
         target_adapter.send.assert_called_once_with("chat_42", "profile alert", metadata=None)
+        runner._authorization_adapter.assert_called_once_with(Platform.TELEGRAM, "profile_1")
+        adapter._target_home_channel.assert_called_once_with(Platform.TELEGRAM, "profile_1")
+
+    @pytest.mark.asyncio
+    async def test_send_does_not_borrow_another_profiles_adapter(self):
+        """Regression (#65939): a routed alert never egresses through another profile's bot.
+
+        The target platform connected only on a DIFFERENT profile: this adapter's own
+        profile has no adapter for it, so the alert degrades to the HA notification
+        instead of being posted as the wrong profile's identity.
+        """
+        adapter = self._make_ha_adapter()
+        adapter._owner_profile = "profile_1"
+        foreign_adapter = self._stub_adapter()
+        runner = self._stub_runner(Platform.TELEGRAM, target_adapter=None, home_chat_id="chat_42")
+        runner._profile_adapters = {"profile_2": {Platform.TELEGRAM: foreign_adapter}}
+        adapter.gateway_runner = runner
+        # A home channel exists for this profile, so borrowing profile_2's adapter WOULD
+        # deliver: only the fail-closed resolution can keep the alert off the wrong bot.
+        adapter._target_home_channel = MagicMock(return_value=_fake_home_channel("chat_42"))
+
+        with patch(
+            "plugins.platforms.homeassistant.adapter.HomeAssistantAdapter._send_ha_notification",
+            new_callable=AsyncMock,
+            return_value=SendResult(success=True),
+        ) as mock_ha_fallback:
+            result = await adapter.send("ha_events:telegram", "cross-profile alert")
+
+        assert result.success is True
+        foreign_adapter.send.assert_not_called()
+        adapter._target_home_channel.assert_not_called()
+        mock_ha_fallback.assert_awaited_once_with("cross-profile alert")
+
+    def test_target_home_channel_reads_own_profile_config(self):
+        """A secondary profile's home channel comes from ITS config.yaml, not the default's."""
+        adapter = self._make_ha_adapter()
+        runner = self._stub_runner(Platform.TELEGRAM, home_chat_id="default_chat")
+        adapter.gateway_runner = runner
+        profile_cfg = MagicMock()
+        profile_cfg.get_home_channel = MagicMock(
+            return_value=_fake_home_channel("profile_chat"))
+        with patch("gateway.config.load_gateway_config", return_value=profile_cfg), patch(
+            "gateway.run._profile_runtime_scope"
+        ) as mock_scope, patch(
+            "hermes_cli.profiles.get_profile_dir", return_value="/tmp/profile_1"
+        ):
+            home = adapter._target_home_channel(Platform.TELEGRAM, "profile_1")
+
+        assert home.chat_id == "profile_chat"
+        profile_cfg.get_home_channel.assert_called_once_with(Platform.TELEGRAM)
+        runner.config.get_home_channel.assert_not_called()
+        mock_scope.assert_called_once_with("/tmp/profile_1")
+
+    def test_target_home_channel_uses_runner_config_without_profile(self):
+        """Primary/default: the runner's own config is the source, no scope switch."""
+        adapter = self._make_ha_adapter()
+        runner = self._stub_runner(Platform.TELEGRAM, home_chat_id="default_chat")
+        adapter.gateway_runner = runner
+
+        home = adapter._target_home_channel(Platform.TELEGRAM, None)
+
+        assert home.chat_id == "default_chat"
+        runner.config.get_home_channel.assert_called_once_with(Platform.TELEGRAM)
 

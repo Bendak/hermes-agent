@@ -410,29 +410,22 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return await self._send_ha_notification(content)
 
-            # Resolve target adapter (primary + profile fallback, mirroring webhook)
-            adapter = self.gateway_runner.adapters.get(target_platform)
-            if not adapter:
-                for _prof, amap in (
-                    getattr(self.gateway_runner, "_profile_adapters", None) or {}
-                ).items():
-                    if not isinstance(amap, dict):
-                        continue
-                    cand = amap.get(target_platform)
-                    if cand is not None:
-                        adapter = cand
-                        break
-
+            # Resolve the target adapter as seen by THIS adapter's own profile, fail-closed:
+            # a routed alert must never egress through another profile's bot (#65939). The
+            # runner helper is the one the webhook delivery path resolves through too.
+            profile = getattr(self, "_owner_profile", None)
+            adapter = self.gateway_runner._authorization_adapter(target_platform, profile)
             if not adapter:
                 logger.warning(
-                    "[%s] Adapter '%s' not connected; "
+                    "[%s] Adapter '%s' not connected for profile '%s'; "
                     "falling back to HA notification",
-                    self.name, platform_name,
+                    self.name, platform_name, profile or "default",
                 )
                 return await self._send_ha_notification(content)
 
-            # Resolve home channel for the target platform
-            home = self.gateway_runner.config.get_home_channel(target_platform)
+            # Home channel of that same profile — a secondary's ``home_channel`` lives in
+            # its own config.yaml, not the default profile's (#65939).
+            home = self._target_home_channel(target_platform, profile)
             if not home or not getattr(home, "chat_id", None):
                 logger.warning(
                     "[%s] No home channel for platform '%s'; "
@@ -457,6 +450,16 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         # Local HA notification delivery (or fallback after routing failure)
         return await self._send_ha_notification(content)
+
+    def _target_home_channel(self, platform: Platform, profile: Optional[str]):
+        """Home channel for *platform* as seen by *profile* (the default's config when unset)."""
+        if not profile:
+            return self.gateway_runner.config.get_home_channel(platform)
+        from gateway.config import load_gateway_config
+        from gateway.run import _profile_runtime_scope
+        from hermes_cli.profiles import get_profile_dir
+        with _profile_runtime_scope(get_profile_dir(profile)):
+            return load_gateway_config().get_home_channel(platform)
 
     async def _send_ha_notification(self, content: str) -> SendResult:
         """Send a notification via HA REST API (persistent_notification.create).
