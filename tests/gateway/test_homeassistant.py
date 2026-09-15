@@ -460,6 +460,18 @@ class TestDeliverTargetParsing:
         assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
         assert "Malformed" in caplog.text or "skipping" in caplog.text
 
+    @pytest.mark.parametrize("bad_entry", [
+        {"climate": {"deliver": "whatsapp"}, "extra": "bad"},  # dict with >1 key
+        {"climate": {"deliver": 123}},                          # non-string deliver
+        42,                                                     # neither str nor dict
+    ])
+    def test_malformed_domain_entries_skipped(self, caplog, bad_entry):
+        """watch_domains malformed entries are skipped with a warning, same as watch_entities."""
+        adapter = _make_deliver_adapter(watch_domains=[bad_entry, "cover"])
+        assert adapter.resolve_deliver_target("climate.thermostat") == "homeassistant"
+        assert adapter.resolve_deliver_target("cover.garage") == "homeassistant"
+        assert "Malformed" in caplog.text or "skipping" in caplog.text
+
     def test_malformed_entries_dont_break_startup(self):
         """Multiple malformed entries don't raise at startup."""
         adapter = _make_deliver_adapter(
