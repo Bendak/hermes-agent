@@ -404,6 +404,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             mode = self.resolve_deliver_mode(entity_id)
             _chat_id = f"ha_events:{target}" + (";session" if mode == "session" else "")
         else:
+            if self.resolve_deliver_mode(entity_id) == "session":
+                # Session integration needs a non-default target session to inject into;
+                # say so instead of silently delivering a plain HA notification.
+                logger.warning(
+                    "[%s] deliver_mode 'session' for %s has no effect with the default "
+                    "target ('homeassistant'); delivering the HA notification — set "
+                    "'deliver' to another platform to enable session integration",
+                    self.name, entity_id,
+                )
             _chat_id = "ha_events"
 
         # Build MessageEvent and forward to handler
@@ -551,13 +560,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return None
             # Owner-only selection (issue #35060 follow-up): the most recent session
-            # entry for this platform+chat inside the adapter's own profile. No
-            # synthetic participant IDs are ever minted in build_session_key().
+            # entry for this platform+chat inside the adapter's own profile. The routing
+            # index is process-wide across profiles (gateway/session_persistence), so
+            # the namespace slot of the session key must match the adapter's profile —
+            # fail-closed, mirroring the rebased #96930's adapter/home-channel scoping.
+            # No synthetic participant IDs are ever minted in build_session_key().
+            from gateway.session import profile_from_session_key_namespace
+            want_profile = profile or "default"
             candidates = [
                 e for e in store.list_sessions()
                 if e.origin is not None
                 and getattr(e.origin, "platform", None) == target_platform
                 and getattr(e.origin, "chat_id", None) == home.chat_id
+                and len(e.session_key.split(":")) > 1
+                and profile_from_session_key_namespace(e.session_key.split(":")[1]) == want_profile
             ]
             if not candidates:
                 logger.info(

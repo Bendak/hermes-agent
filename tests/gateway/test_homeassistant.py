@@ -986,14 +986,76 @@ def test_deliver_mode_invalid_falls_back_to_broadcast():
     assert adapter._default_deliver_mode == "broadcast"
 
 
-def test_handle_event_tag_carries_session_suffix():
+@pytest.mark.asyncio
+async def test_handle_event_tags_chat_id_with_target_and_session_suffix():
+    """Production tag path: _handle_ha_event must emit a MessageEvent whose
+    source.chat_id carries the resolved target and the ;session suffix when
+    deliver_mode is session (and the plain target tag when broadcast)."""
+    from gateway.platforms.event import MessageEvent
+
+    # session mode
     adapter = _make_session_mode_adapter(
         watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
     )
-    target = adapter.resolve_deliver_target("sensor.s")
-    mode = adapter.resolve_deliver_mode("sensor.s")
-    tag = f"ha_events:{target}" + (";session" if mode == "session" else "")
-    assert tag == "ha_events:whatsapp;session"
+    adapter.handle_message = AsyncMock()
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+    adapter.handle_message.assert_called_once()
+    event = adapter.handle_message.call_args[0][0]
+    assert isinstance(event, MessageEvent)
+    assert event.source.chat_id == "ha_events:whatsapp;session"
+
+    # broadcast mode: target tag, no suffix
+    adapter_b = _make_session_mode_adapter(
+        watch_entities=["sensor.s"], deliver="whatsapp",
+    )
+    adapter_b.handle_message = AsyncMock()
+    await adapter_b._handle_ha_event(_make_event("sensor.s", "1", "2"))
+    event_b = adapter_b.handle_message.call_args[0][0]
+    assert event_b.source.chat_id == "ha_events:whatsapp"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_lookup_is_profile_scoped():
+    """The routing index is process-wide across profiles: the candidate filter
+    must only pick entries whose session-key namespace matches the adapter's
+    own profile, or a multiplex deployment could inject into another
+    profile's session (fail-closed, mirroring #96930's adapter scoping)."""
+    from types import SimpleNamespace
+
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    other_profile_entry = _Entry("agent:work:whatsapp:group:G:u2", "G", updated_at=2)
+    own_profile_entry = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
+    runner = _Runner(wa, _Store([other_profile_entry, own_profile_entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert wa.handled, "injection must happen for the adapter's own profile session"
+    assert wa.handled[0].metadata["gateway_session_key"] == own_profile_entry.session_key, (
+        "must pick the adapter's own profile's entry, never another profile's "
+        "newer entry for the same chat"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_mode_with_default_target_logs_warning(caplog):
+    """deliver_mode: session with the default target must log — session
+    integration has no target session to inject into when the target is
+    'homeassistant'."""
+    import logging
+
+    adapter = _make_session_mode_adapter(
+        watch_entities=["sensor.s"], deliver_mode="session",
+    )
+    adapter.handle_message = AsyncMock()
+    with caplog.at_level(logging.WARNING, logger="plugins.platforms.homeassistant.adapter"):
+        await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+    adapter.handle_message.assert_called_once()
+    event = adapter.handle_message.call_args[0][0]
+    assert event.source.chat_id == "ha_events"  # plain local path
+    assert any("no effect with the default target" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio

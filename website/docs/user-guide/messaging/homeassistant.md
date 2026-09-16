@@ -208,6 +208,35 @@ platforms:
 
 The `deliver` value is the name of any connected platform: `telegram`, `whatsapp`, `signal`, `discord`, `slack`, or any other platform configured and connected to the gateway. If the target platform is unknown or not currently connected, the alert falls back to an HA persistent notification and a warning is logged.
 
+### Delivery Mode: `broadcast` vs `session`
+
+On top of the `deliver` target, `deliver_mode` controls **how** the event reaches the target chat:
+
+- **`broadcast` (default)** — the event is sent to the target chat as a plain message. It appears in the chat, but does not enter that chat's conversation history (the agent turn runs in the Home Assistant session).
+- **`session`** — the event is injected into the target chat's most recent live session as an internal notification (`display_kind: internal_notification`), and a full agent turn runs **in that session**. Follow-ups in the target chat have the event in context, and the agent can act on it (validate state, escalate, archive). The synthetic event is marked `internal` with `allow_gateway_control: false`, so external event text can never resolve gateway commands — it stays conversational.
+
+```yaml
+homeassistant:
+  enabled: true
+  extra:
+    watch_entities:
+      - alarm_control_panel.example_alarm
+    deliver: whatsapp
+    deliver_mode: session                # top-level default
+    # per-entry override (dict form):
+    # - sensor.example_pet_camera: {deliver: whatsapp, deliver_mode: broadcast}
+```
+
+Precedence matches `deliver` itself: per-entry override → top-level key → `broadcast`.
+
+Behavior notes:
+
+- **Session selection is owner-only and profile-scoped**: the most recent session for the target chat **inside the adapter's own profile** receives the injection. No per-participant fan-out and no synthetic sessions are minted.
+- **No prior session for the chat** → the delivery degrades to `broadcast`.
+- **Fallback chain (per stage)**: session injection → broadcast → HA persistent notification. An alert is never silently dropped.
+- **`deliver_mode: session` with the default target (`homeassistant`)** has no target session to integrate with: it logs a warning and delivers the HA notification.
+- Session mode consumes an agent turn in the target chat per delivered event — opt in explicitly when the conversational integration is worth the cost.
+
 ### Connection Management
 
 - **WebSocket** with 30-second heartbeat for real-time events
