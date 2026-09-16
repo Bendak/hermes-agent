@@ -1020,8 +1020,6 @@ async def test_session_mode_lookup_is_profile_scoped():
     must only pick entries whose session-key namespace matches the adapter's
     own profile, or a multiplex deployment could inject into another
     profile's session (fail-closed, mirroring #96930's adapter scoping)."""
-    from types import SimpleNamespace
-
     adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
     wa = _RecordingAdapter()
     other_profile_entry = _Entry("agent:work:whatsapp:group:G:u2", "G", updated_at=2)
@@ -1131,7 +1129,9 @@ async def test_session_mode_injection_not_accepted_falls_back_to_broadcast():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_without_runner_falls_back_to_ha_notification(monkeypatch):
+async def test_send_without_runner_falls_back_to_ha_notification(monkeypatch):
+    """Pre-existing guard, not session-specific: no runner at all → HA notification.
+    (The no-runner check fires before any session-mode code.)"""
     adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
     adapter.gateway_runner = None
     monkeypatch.setattr(
@@ -1140,6 +1140,96 @@ async def test_session_mode_without_runner_falls_back_to_ha_notification(monkeyp
     )
     result = await adapter.send("ha_events:whatsapp;session", "event")
     assert result.success and result.message_id == "ha-1"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_without_session_store_falls_back_to_broadcast(monkeypatch):
+    """Session-mode early guard: a runner without a session store must degrade to
+    broadcast delivery, not crash or drop the alert."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    runner.session_store = None  # guard fires before the store is touched
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert not wa.handled, "no store → no injection"
+    assert wa.sent, "no store → broadcast delivery"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_cancelled_error_during_injection_falls_back():
+    """asyncio.CancelledError is a BaseException (3.8+): a shutdown-time
+    cancellation during admit_internal_event must still degrade to broadcast —
+    the 'never a silent drop' contract holds for cancellation too."""
+    import asyncio
+
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+
+    class _CancellingAdapter(_RecordingAdapter):
+        async def handle_message(self, event):
+            self.handled.append(event)
+            raise asyncio.CancelledError()
+
+    wa = _CancellingAdapter()
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert wa.handled, "injection was attempted and cancelled"
+    assert wa.sent, "cancellation during injection must fall back to broadcast"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_stale_session_degrades_to_broadcast():
+    """Freshness guard: a session entry far outside the freshness window is not an
+    injection candidate — the event degrades to broadcast instead of disappearing
+    into a dead session."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
+    runner = _Runner(wa, _Store([stale]))
+    # A store honoring active_minutes drops entries outside the freshness window
+    # (the adapter now passes active_minutes on every call). Emulate that: with a
+    # window set, only in-window entries are returned; the stale entry never is.
+    runner.session_store.list_sessions = lambda active_minutes=None: (
+        [stale] if active_minutes is None else []
+    )
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert not wa.handled, "stale session must not receive the injection"
+    assert wa.sent, "stale session → broadcast delivery"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_wake_text_truncates_oversized_content():
+    """Entity state values can be arbitrarily large; the injected wake text is
+    bounded so one event cannot blow the target session's context budget."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    huge = "x" * (HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 5000)
+    result = await adapter.send("ha_events:whatsapp;session", huge)
+
+    assert result.success
+    assert wa.handled
+    text = wa.handled[0].text
+    assert len(text) < HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 200
+    # The truncation marker sits before the fixed envelope suffix.
+    assert "[truncated]" in text
+    assert text.endswith("(cross-platform event delivery; reply here if action is needed)")
 
 
 @pytest.mark.asyncio

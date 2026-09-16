@@ -66,6 +66,11 @@ _TRIGGERED = ("cleared", "triggered")  # binary_sensor wording, indexed by ``sta
 
 
 class HomeAssistantAdapter(BasePlatformAdapter):
+    # Session-mode freshness window: only sessions active within this window are
+    # injection candidates (stale/ended sessions fall back to broadcast).
+    _SESSION_FRESHNESS_MINUTES = 24 * 60
+    # Upper bound for event content injected into a target session's wake text.
+    _WAKE_TEXT_MAX_CONTENT = 2000
     """``state_changed`` -> MessageEvents with domain/entity filtering and per-entity cooldowns."""
 
     MAX_MESSAGE_LENGTH = 4096
@@ -567,8 +572,11 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # No synthetic participant IDs are ever minted in build_session_key().
             from gateway.session import profile_from_session_key_namespace
             want_profile = profile or "default"
+            # Freshness guard: injecting into a session nobody has watched in days
+            # silently swallows the event. Only sessions active within the window
+            # are candidates; older ones degrade to broadcast.
             candidates = [
-                e for e in store.list_sessions()
+                e for e in store.list_sessions(active_minutes=self._SESSION_FRESHNESS_MINUTES)
                 if e.origin is not None
                 and getattr(e.origin, "platform", None) == target_platform
                 and getattr(e.origin, "chat_id", None) == home.chat_id
@@ -584,8 +592,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 return None
             entry = max(candidates, key=lambda e: e.updated_at)
             # Envelope: gateway-authored text, metadata only, no judgments.
+            # Bound the payload: entity state values can be arbitrarily large
+            # (webhook JSON, base64), and an unbounded wake text would blow the
+            # target session's context budget.
+            trimmed = content[:self._WAKE_TEXT_MAX_CONTENT]
+            if len(content) > len(trimmed):
+                trimmed += "… [truncated]"
             wake_text = (
-                f"[Home Assistant] {content}\n"
+                f"[Home Assistant] {trimmed}\n"
                 "(cross-platform event delivery; reply here if action is needed)"
             )
             # Synthesize the internal event by hand: admit_internal_event's
@@ -595,8 +609,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             from gateway.platforms.event import MessageEvent, MessageType
             from gateway.wake import admit_internal_event
             # Reuse the target session's own origin as the event source (run_inbound's
-            # plugin-injection events do the same) — copy it so the adapter never
-            # receives a mutable shared instance.
+            # plugin-injection events do the same). SessionSource is always a dataclass,
+            # so the replace() copy holds; if a non-dataclass origin type ever appears
+            # here, add an explicit shallow copy for it.
             origin = entry.origin
             if dataclasses.is_dataclass(origin) and not isinstance(origin, type):
                 origin = dataclasses.replace(origin)
@@ -615,8 +630,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 "[%s] Session-integrated delivery injected into %s",
                 self.name, entry.session_key,
             )
-            return SendResult(success=True, message_id=uuid.uuid4().hex[:12])
-        except Exception as e:
+            # Synthetic id: full hex (collision-safe); no external referent —
+            # the injected turn's own message ids live in the target session.
+            return SendResult(success=True, message_id=uuid.uuid4().hex)
+        except BaseException as e:
+            # BaseException, not Exception: asyncio.CancelledError is a BaseException
+            # (3.8+), and a shutdown-time cancellation during admit_internal_event must
+            # still degrade to broadcast, not escape send() and drop the alert — the
+            # broadcast leg below re-raises cancellation after its own fallback.
             logger.warning(
                 "[%s] Session-integrated delivery to '%s' failed (%s); "
                 "falling back to broadcast",
