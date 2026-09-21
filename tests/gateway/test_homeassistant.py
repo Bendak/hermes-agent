@@ -1229,7 +1229,10 @@ async def test_session_mode_wake_text_truncates_oversized_content():
     assert len(text) < HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 200
     # The truncation marker sits before the fixed envelope suffix.
     assert "[truncated]" in text
-    assert text.endswith("(cross-platform event delivery; reply here if action is needed)")
+    assert text.endswith(
+        "(cross-platform event delivery — informational unless action is needed; "
+        "reply NO_REPLY if there is nothing to do)"
+    )
 
 
 @pytest.mark.asyncio
@@ -1286,3 +1289,76 @@ async def test_fallback_chain_broadcast_failure_reaches_ha_notification(monkeypa
     )
     result = await adapter.send("ha_events:whatsapp", "event")
     assert result.message_id == "ha-fb"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_injection_budget_degrades_to_broadcast():
+    """Each injected event buys a full agent turn in the target session, so the
+    adapter caps injections per session per rolling window. Past the cap the
+    delivery must degrade to broadcast — never dropped, never a silent no-op."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    cap = HomeAssistantAdapter._INJECTIONS_PER_SESSION_PER_HOUR
+    # Under the cap: injections accepted, no broadcast.
+    for i in range(cap):
+        result = await adapter.send("ha_events:whatsapp;session", f"event {i}")
+        assert result.success
+    assert len(wa.handled) == cap, f"expected {cap} injections, got {len(wa.handled)}"
+    assert not wa.sent, "no broadcast while under the budget"
+
+    # Past the cap: broadcast takes over for the same session.
+    result = await adapter.send("ha_events:whatsapp;session", "over budget")
+    assert result.success
+    assert len(wa.handled) == cap, "no further injection past the cap"
+    assert wa.sent and wa.sent[-1][0] == "G", "over-budget delivery degrades to broadcast"
+
+
+@pytest.mark.asyncio
+async def test_injection_budget_window_expires():
+    """The budget is a rolling window, not a lifetime quota: entries older than
+    the window are pruned and the session becomes injectable again."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    cap = HomeAssistantAdapter._INJECTIONS_PER_SESSION_PER_HOUR
+    window = HomeAssistantAdapter._INJECTION_WINDOW_SECONDS
+    stale = time.time() - window - 1  # just outside the window
+    adapter._injection_times[entry.session_key] = [stale] * cap
+
+    result = await adapter.send("ha_events:whatsapp;session", "after window")
+
+    assert result.success
+    assert wa.handled, "expired entries must not block injection"
+    assert not wa.sent, "no broadcast needed once the window rolled over"
+
+
+@pytest.mark.asyncio
+async def test_injected_envelope_states_silence_contract():
+    """The injected envelope must carry the reply contract (informational unless
+    action is needed; NO_REPLY otherwise) so the agent does not buy an
+    acknowledgement reply for every event — the gateway's silence path only
+    suppresses delivery when the model chooses a silence marker."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "portao aberto")
+
+    assert result.success and wa.handled
+    text = wa.handled[0].text
+    assert "informational unless action is needed" in text
+    assert "NO_REPLY" in text
+    # The silence marker the guidance names must be one the gateway actually honors.
+    from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
+    assert "NO_REPLY" in LIVE_GATEWAY_SILENT_MARKERS, (
+        "the envelope must name a marker the gateway's silence path recognizes"
+    )

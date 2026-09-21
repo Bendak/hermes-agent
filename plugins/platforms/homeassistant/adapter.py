@@ -71,6 +71,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     _SESSION_FRESHNESS_MINUTES = 24 * 60
     # Upper bound for event content injected into a target session's wake text.
     _WAKE_TEXT_MAX_CONTENT = 2000
+    # Injection budget: each accepted injection triggers a full agent turn in the
+    # target session, so an unbounded event stream (flapping sensors, busy zones)
+    # would saturate that session with turns and replies. At most this many
+    # injections per session per rolling hour; beyond it, deliveries degrade to
+    # broadcast (never dropped) with a warning.
+    _INJECTIONS_PER_SESSION_PER_HOUR = 12
+    _INJECTION_WINDOW_SECONDS = 3600
     """``state_changed`` -> MessageEvents with domain/entity filtering and per-entity cooldowns."""
 
     MAX_MESSAGE_LENGTH = 4096
@@ -223,6 +230,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         # Cooldown tracking: entity_id -> last_event_timestamp
         self._last_event_time: Dict[str, float] = {}
+        # Session-injection budget: session_key -> injection timestamps inside the
+        # rolling window (pruned on each decision, bounded by the cap).
+        self._injection_times: Dict[str, list] = {}
+
     def _next_id(self) -> int:
         self._msg_id += 1
         return self._msg_id
@@ -598,9 +609,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             trimmed = content[:self._WAKE_TEXT_MAX_CONTENT]
             if len(content) > len(trimmed):
                 trimmed += "… [truncated]"
+            # The suffix states the reply contract: informational by default, and
+            # explicitly silent when there is nothing to do. Without it every
+            # injected event buys an acknowledgement reply — the gateway's
+            # NO_REPLY silence path only suppresses delivery if the model picks it.
             wake_text = (
                 f"[Home Assistant] {trimmed}\n"
-                "(cross-platform event delivery; reply here if action is needed)"
+                "(cross-platform event delivery — informational unless action is "
+                "needed; reply NO_REPLY if there is nothing to do)"
             )
             # Synthesize the internal event by hand: admit_internal_event's
             # deliver_wake helper does not expose allow_gateway_control, and event
@@ -625,6 +641,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     "hermes_cross_platform_delivery": True,
                 },
             )
+            if not self._consume_injection_budget(entry.session_key):
+                logger.warning(
+                    "[%s] Session injection budget exhausted for %s "
+                    "(> %d in %dm); delivering as broadcast instead",
+                    self.name, entry.session_key,
+                    self._INJECTIONS_PER_SESSION_PER_HOUR,
+                    self._INJECTION_WINDOW_SECONDS // 60,
+                )
+                return None  # caller falls back to broadcast
             await admit_internal_event(adapter, synth_event)
             logger.info(
                 "[%s] Session-integrated delivery injected into %s",
@@ -644,6 +669,24 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 self.name, getattr(target_platform, "value", target_platform), e,
             )
             return None
+
+    def _consume_injection_budget(self, session_key: str) -> bool:
+        """Rolling-window injection budget for one target session.
+
+        True (and records the injection) while the session is under the per-hour
+        cap; False once reached, so the caller degrades to broadcast. In-memory
+        only: the adapter lives for the gateway process, so a restart resets the
+        window rather than persisting a stale allowance.
+        """
+        now = time.time()
+        cutoff = now - self._INJECTION_WINDOW_SECONDS
+        recent = [t for t in self._injection_times.get(session_key, []) if t > cutoff]
+        if len(recent) >= self._INJECTIONS_PER_SESSION_PER_HOUR:
+            self._injection_times[session_key] = recent  # keep pruned state
+            return False
+        recent.append(now)
+        self._injection_times[session_key] = recent
+        return True
 
     def _target_home_channel(self, platform: Platform, profile: Optional[str]):
         """Home channel for *platform* as seen by *profile* (the default's config when unset)."""
