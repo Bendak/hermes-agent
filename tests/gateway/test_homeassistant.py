@@ -912,11 +912,42 @@ class _Entry:
 
 
 class _Store:
+    """Session-store stand-in: list-based reads plus the deterministic
+    get_or_create_session used by session-mode targeting."""
+
     def __init__(self, entries):
         self._entries = entries
+        self.created = []
 
     def list_sessions(self, active_minutes=None):
         return list(self._entries)
+
+    def get_or_create_session(self, source, force_new=False, touch_activity=True):
+        """Return the entry whose key matches *source*, creating one if absent.
+
+        Mirrors the real store: the key comes from the source (deterministic),
+        never from recency — and touch_activity is recorded so tests can assert
+        the injection path does not reset the user-activity clock.
+        """
+        from gateway.session import build_session_key as _bk
+        from gateway.config import load_gateway_config as _lgc
+        try:
+            _cfg = _lgc()
+            per_user = getattr(_cfg, "group_sessions_per_user", True)
+            per_thread = getattr(_cfg, "thread_sessions_per_user", False)
+        except Exception:
+            per_user, per_thread = True, False
+        key = _bk(source, group_sessions_per_user=per_user, thread_sessions_per_user=per_thread)
+        for e in self._entries:
+            if e.session_key == key:
+                if touch_activity:
+                    e.touched = True
+                return e
+        fresh = _Entry(key, source.chat_id, updated_at=0, user_id=getattr(source, "user_id", None))
+        fresh.created = True
+        self._entries.append(fresh)
+        self.created.append(fresh)
+        return fresh
 
 
 class _RecordingAdapter:
@@ -1020,29 +1051,6 @@ async def test_handle_event_tags_chat_id_with_target_and_session_suffix():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_lookup_is_profile_scoped():
-    """The routing index is process-wide across profiles: the candidate filter
-    must only pick entries whose session-key namespace matches the adapter's
-    own profile, or a multiplex deployment could inject into another
-    profile's session (fail-closed, mirroring #96930's adapter scoping)."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    other_profile_entry = _Entry("agent:work:whatsapp:group:G:u2", "G", updated_at=2)
-    own_profile_entry = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
-    runner = _Runner(wa, _Store([other_profile_entry, own_profile_entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert wa.handled, "injection must happen for the adapter's own profile session"
-    assert wa.handled[0].metadata["gateway_session_key"] == own_profile_entry.session_key, (
-        "must pick the adapter's own profile's entry, never another profile's "
-        "newer entry for the same chat"
-    )
-
-
-@pytest.mark.asyncio
 async def test_session_mode_with_default_target_logs_warning(caplog):
     """deliver_mode: session with the default target must log — session
     integration has no target session to inject into when the target is
@@ -1081,7 +1089,9 @@ async def test_session_mode_injects_internal_event_with_guards():
     assert event.internal is True
     assert event.allow_gateway_control is False
     assert event.metadata["hermes_cross_platform_delivery"] is True
-    assert event.metadata["gateway_session_key"] == entry.session_key
+    # Target is resolved deterministically from the home channel, not from the
+    # entry list: the key is derived for the chat, not chosen by recency.
+    assert event.metadata["gateway_session_key"] == "agent:main:whatsapp:group:G"
     assert "portao opened" in event.text
     # No duplicated source prefix: the adapter's own templates already open with it.
     assert not event.text.startswith("[Home Assistant] [Home Assistant]")
@@ -1105,17 +1115,22 @@ async def test_session_mode_omitted_injection_fails_the_assertion():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_without_prior_session_falls_back_to_broadcast():
+async def test_session_mode_without_prior_session_creates_the_target():
+    """A chat with no session yet is not a dead end: the target is resolved
+    deterministically from the home channel (get_or_create_session), so the first
+    event lands in the chat's own session instead of falling back forever."""
     adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
     wa = _RecordingAdapter()
-    runner = _Runner(wa, _Store([]))
+    store = _Store([])
+    runner = _Runner(wa, store)
     _wire_session_mode(adapter, runner, runner.home())
 
     result = await adapter.send("ha_events:whatsapp;session", "event")
 
     assert result.success
-    assert not wa.handled
-    assert wa.sent and wa.sent[0][0] == "G"
+    assert wa.handled, "the chat's session must be created and receive the injection"
+    assert not wa.sent, "no broadcast needed once the target session exists"
+    assert store.created, "the target session was created deterministically"
 
 
 @pytest.mark.asyncio
@@ -1194,30 +1209,6 @@ async def test_session_mode_cancelled_error_during_injection_falls_back():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_stale_session_degrades_to_broadcast():
-    """Freshness guard: a session entry far outside the freshness window is not an
-    injection candidate — the event degrades to broadcast instead of disappearing
-    into a dead session."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
-    runner = _Runner(wa, _Store([stale]))
-    # A store honoring active_minutes drops entries outside the freshness window
-    # (the adapter now passes active_minutes on every call). Emulate that: with a
-    # window set, only in-window entries are returned; the stale entry never is.
-    runner.session_store.list_sessions = lambda active_minutes=None: (
-        [stale] if active_minutes is None else []
-    )
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert not wa.handled, "stale session must not receive the injection"
-    assert wa.sent, "stale session → broadcast delivery"
-
-
-@pytest.mark.asyncio
 async def test_session_mode_wake_text_truncates_oversized_content():
     """Entity state values can be arbitrarily large; the injected wake text is
     bounded so one event cannot blow the target session's context budget."""
@@ -1240,67 +1231,6 @@ async def test_session_mode_wake_text_truncates_oversized_content():
         "(cross-platform event delivery — informational unless action is needed; "
         "reply NO_REPLY if there is nothing to do)"
     )
-
-
-@pytest.mark.asyncio
-async def test_session_mode_ignores_stale_key_shape_entries(monkeypatch):
-    """Under a non-per-user grouping config, a chat has exactly ONE valid key
-    shape. An entry left over from before the config change keeps the old shape and
-    cannot be injected through (the adapter re-derives the key and drops the event
-    as a mismatch), so the selector must skip it — even when it is the newest — and
-    use the valid entry instead.
-
-    The ambient config is pinned explicitly: the suite's HERMES_HOME isolation
-    would otherwise leave load_gateway_config() at the default (per-user) grouping.
-    """
-    import gateway.config as _gc
-
-    class _Cfg:
-        group_sessions_per_user = False
-        thread_sessions_per_user = False
-
-    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg())
-
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    # Stale shape (participant suffix), NEWEST timestamp — must be skipped.
-    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
-    # Valid shape under the pinned config, older — must be chosen.
-    valid = _Entry("agent:main:whatsapp:group:G", "G", updated_at=1, user_id=None)
-    runner = _Runner(wa, _Store([stale, valid]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert wa.handled, "the valid entry must receive the injection"
-    assert wa.handled[0].metadata["gateway_session_key"] == valid.session_key, (
-        "a newer stale-shape entry must not win over the valid entry"
-    )
-
-
-@pytest.mark.asyncio
-async def test_session_mode_degrades_when_only_stale_entries_exist(monkeypatch):
-    """With no valid-shape entry at all, delivery must degrade to broadcast rather
-    than inject through an entry the adapter will reject downstream."""
-    import gateway.config as _gc
-
-    class _Cfg:
-        group_sessions_per_user = False
-        thread_sessions_per_user = False
-
-    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg())
-
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
-    runner = _Runner(wa, _Store([stale]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert not wa.handled, "no valid entry → no injection"
-    assert wa.sent, "no valid entry → broadcast delivery"
 
 
 @pytest.mark.asyncio
@@ -1507,29 +1437,3 @@ async def test_injected_envelope_has_no_duplicate_source_prefix():
     assert "[Home Assistant] [Home Assistant]" not in text
 
 
-@pytest.mark.asyncio
-async def test_stale_key_shape_entries_are_not_injection_candidates(monkeypatch):
-    """Entries whose session key no longer matches what the gateway derives today
-    (grouping config changed since they were created) must not be selected: an
-    injection through one is dropped downstream as a derived-key mismatch, which
-    would degrade every delivery to broadcast without a signal."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    # Pre-change key shape: participant appended (per_user was True).
-    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
-    runner = _Runner(wa, _Store([stale]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    # Current config: grouping is NOT per-user, so the derived key drops the participant.
-    class _Cfg:
-        group_sessions_per_user = False
-        thread_sessions_per_user = False
-
-    import gateway.config as _gc
-    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg(), raising=False)
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert not wa.handled, "stale-key-shape entry must not be injected through"
-    assert wa.sent, "it must degrade to broadcast instead"
