@@ -65,20 +65,26 @@ def _auth_headers(token: str) -> Dict[str, str]:
 
 
 # domain -> description template; see ``_format_state_change`` for the fields.
-_TURNED = "[Home Assistant] {name}: turned {on_off}"
+# NOTE: these templates deliberately carry NO source prefix. Two independent
+# attribution layers add one: the gateway prefixes shared multi-user sessions with
+# the sender name ("[Home Assistant] ", since HA events arrive with that
+# user_name), and an injected event is wrapped by the adapter itself. Embedding a
+# prefix here produced "[Home Assistant] [Home Assistant] ..." on every event in a
+# shared session.
+_TURNED = "{name}: turned {on_off}"
 _DOMAIN_TEMPLATES = {
     "climate": (
-        "[Home Assistant] {name}: HVAC mode changed from "
+        "{name}: HVAC mode changed from "
         "'{old}' to '{new}' (current: {temp}, target: {target})"
     ),
-    "sensor": "[Home Assistant] {name}: changed from {old}{unit} to {new}{unit}",
-    "binary_sensor": "[Home Assistant] {name}: {new_trig} (was {old_trig})",
+    "sensor": "{name}: changed from {old}{unit} to {new}{unit}",
+    "binary_sensor": "{name}: {new_trig} (was {old_trig})",
     "light": _TURNED,
     "switch": _TURNED,
     "fan": _TURNED,
-    "alarm_control_panel": "[Home Assistant] {name}: alarm state changed from '{old}' to '{new}'",
+    "alarm_control_panel": "{name}: alarm state changed from '{old}' to '{new}'",
 }
-_DEFAULT_TEMPLATE = "[Home Assistant] {name} ({entity_id}): changed from '{old}' to '{new}'"
+_DEFAULT_TEMPLATE = "{name} ({entity_id}): changed from '{old}' to '{new}'"
 _TRIGGERED = ("cleared", "triggered")  # binary_sensor wording, indexed by ``state == "on"``
 
 
@@ -450,6 +456,26 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
             _chat_id = "ha_events"
 
+        # Session-integrated delivery (issue #35060 follow-up): inject the EVENT
+        # into the target chat's session so the agent reasons THERE — inside that
+        # chat's own history — instead of answering from the source session and
+        # shipping the result across platforms.
+        #
+        # Injecting at this point is what makes the integration real: the previous
+        # shape intercepted the outbound reply in send(), which moved the agent's
+        # ANSWER into the target session (wrong history for the reasoning, and a
+        # second agent turn per event). Deciding here means the event is the thing
+        # injected, the source session runs no turn at all, and the cost stays one
+        # turn per event.
+        if _chat_id.endswith(";session"):
+            if await self._inject_event_into_target_session(
+                message, target_platform_name=target, entity_id=entity_id,
+            ):
+                return  # delivered into the target session; no source-session turn
+            # Not injectable (no home channel, unresolved session, budget spent):
+            # fall through to the normal source-session path, which broadcasts.
+            _chat_id = _chat_id.split(";")[0]
+
         # Build MessageEvent and forward to handler
         source = self.build_source(
             chat_id=_chat_id, chat_name="Home Assistant Events", chat_type="channel",
@@ -538,24 +564,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return await self._send_ha_notification(content)
 
-            # Session-integrated delivery (issue #35060 follow-up): inject the event
-            # into the target chat's most recent live session via the gateway's
-            # internal-event carrier — the same mechanism background notifications
-            # and watcher wakes use (gateway/wake.py). The synthetic event carries
-            # internal=True (persisted as display_kind="internal_notification",
-            # bypasses user-authorization minting) and allow_gateway_control=False
-            # (event text can never resolve gateway commands / pending prompts —
-            # untrusted payload stays conversational). A full agent turn runs in
-            # the target session, so follow-ups there have the event in context.
-            # Fallback chain: injection → broadcast adapter.send() → HA notification.
-            session_mode = chat_id.endswith(";session")
-            if session_mode:
-                injected = await self._inject_into_target_session(
-                    adapter, target_platform, home, content, profile,
-                )
-                if injected is not None:
-                    return injected  # SendResult from the injection path
-
             # Broadcast delivery (default #96930 behavior, and the fallback when
             # session mode is off or injection was not possible).
             # Fail-safe: a raise from the target adapter must never escape
@@ -575,153 +583,142 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         # Local HA notification delivery (or fallback after routing failure)
         return await self._send_ha_notification(content)
 
-    async def _inject_into_target_session(
-        self, adapter, target_platform: Platform, home, content: str, profile: Optional[str],
-    ):
-        """Inject *content* into the target chat's most recent live session.
+    async def _inject_event_into_target_session(
+        self, message: str, *, target_platform_name: str, entity_id: str,
+    ) -> bool:
+        """Inject one HA event into the target platform's home-channel session.
 
-        Returns a successful :class:`SendResult` when the injection was accepted,
-        or ``None`` when the caller must fall back to broadcast delivery (no
-        prior session for the chat, store unavailable, authorization failed,
-        budget exhausted, or the carrier rejected the event). Never raises — a
-        session-mode delivery must degrade, not drop the alert.
+        Returns True when the event was accepted into the target session — in
+        which case the caller must NOT also run a turn in the source session.
+        Returns False on any condition that makes injection impossible, so the
+        caller falls through to the normal source-session path (broadcast).
 
-        Contracts this method relies on:
-
-        * ``admit_internal_event`` signals acceptance by raising
-          (``WakeNotAccepted``) and returns cleanly on success. A future change
-          that reports failure via a return value instead would make this call
-          site claim success for a failed injection and skip the broadcast.
-        * Cancellation is deliberately converted into a broadcast rather than
-          re-raised: for alert delivery, degrading beats propagating, and the
-          broadcast leg honors cancellation in its own try/except. Callers that
-          need strict cooperative cancellation must not rely on this method to
-          propagate it.
+        Never raises: a delivery that cannot be integrated must degrade to the
+        established path, not drop the event.
         """
         try:
+            if not self.gateway_runner:
+                logger.warning(
+                    "[%s] No gateway runner; delivering '%s' via the source session",
+                    self.name, entity_id,
+                )
+                return False
+            try:
+                target_platform = Platform(target_platform_name.strip().lower())
+            except ValueError:
+                logger.warning(
+                    "[%s] Unknown deliver platform '%s'; delivering via the source session",
+                    self.name, target_platform_name,
+                )
+                return False
+
+            profile = getattr(self, "_owner_profile", None)
+            adapter = self.gateway_runner._authorization_adapter(target_platform, profile)
+            if not adapter:
+                logger.warning(
+                    "[%s] Adapter '%s' not connected for profile '%s'; "
+                    "delivering via the source session",
+                    self.name, target_platform_name, profile or "default",
+                )
+                return False
+
+            home = self._target_home_channel(target_platform, profile)
+            if not home or not getattr(home, "chat_id", None):
+                logger.warning(
+                    "[%s] No home channel for platform '%s'; delivering via the source session",
+                    self.name, target_platform_name,
+                )
+                return False
+
             store = getattr(self.gateway_runner, "session_store", None)
             if store is None:
                 logger.warning(
-                    "[%s] Session store unavailable; falling back to broadcast",
-                    self.name,
+                    "[%s] Session store unavailable; delivering via the source session", self.name,
                 )
-                return None
-            # Owner-only selection (issue #35060 follow-up): the most recent session
-            # entry for this platform+chat inside the adapter's own profile. The routing
-            # index is process-wide across profiles (gateway/session_persistence), so
-            # the namespace slot of the session key must match the adapter's profile —
-            # fail-closed, mirroring the rebased #96930's adapter/home-channel scoping.
-            # No synthetic participant IDs are ever minted in build_session_key().
-            from gateway.session import profile_from_session_key_namespace
-            want_profile = profile or "default"
-            # Deterministic target resolution (issue #35060 follow-up). The target
-            # session is derived from the home channel, never chosen by recency:
-            #
-            #   - recency is self-perpetuating — an injected turn refreshes the
-            #     session's activity clock, so the session that just received an
-            #     injection becomes the most likely target for the next one (we
-            #     observed a 109-day-old session kept alive this way), and
-            #   - in a per-participant group it selects someone else's thread.
-            #
-            # The same shape existing subsystems use: address a specific
-            # destination (kanban reconstructs the creator's session from
-            # persisted metadata; cron targets the job's origin chat), instead of
-            # guessing from activity. The key is derived from the home channel
-            # under the current grouping config, so it stays correct across
-            # config changes and needs no freshness window at all.
+                return False
+
+            # Deterministic target: derived from the home channel under the current
+            # grouping config. Never chosen by recency — an injected turn refreshes
+            # a session's activity clock, so recency is self-perpetuating, and in a
+            # per-participant group it selects someone else's thread.
             from gateway.session import SessionSource
-            from gateway.config import load_gateway_config
-            _cfg = load_gateway_config()
+            want_profile = profile or "default"
             home_source = SessionSource(
-                platform=target_platform,
-                chat_id=home.chat_id,
+                platform=target_platform, chat_id=home.chat_id,
                 chat_type=getattr(home, "chat_type", None) or "group",
                 thread_id=getattr(home, "thread_id", None) or None,
                 user_id=getattr(home, "user_id", None) or None,
                 profile=want_profile if want_profile != "default" else None,
             )
             entry = store.get_or_create_session(home_source, touch_activity=False)
-            # Envelope: gateway-authored text, metadata only, no judgments.
-            # Bound the payload: entity state values can be arbitrarily large
-            # (webhook JSON, base64), and an unbounded wake text would blow the
-            # target session's context budget.
-            trimmed = content[:self._WAKE_TEXT_MAX_CONTENT]
-            if len(content) > len(trimmed):
-                trimmed += "… [truncated]"
-            # Entity values are untrusted text and may themselves contain a marker
-            # the gateway treats as silence ("NO_REPLY", "[SILENT]"). Left intact,
-            # such a value could make the agent "reply" with the marker it just read,
-            # suppressing a real alert with no user-visible trace. Strip known
-            # markers from the payload before wrapping it.
+
+            # Budget is per CHAT: group chats key one session per participant, so a
+            # per-session cap would multiply by participant count.
+            budget_key = f"{target_platform.value}:{home.chat_id}"
+            if not self._consume_injection_budget(budget_key):
+                logger.warning(
+                    "[%s] Session injection budget exhausted for chat %s "
+                    "(> %d in %dm); delivering via the source session instead",
+                    self.name, budget_key,
+                    self._INJECTIONS_PER_CHAT_PER_HOUR,
+                    self._INJECTION_WINDOW_SECONDS // 60,
+                )
+                return False
+
+            # Entity values are untrusted and may contain a marker the gateway
+            # treats as silence; strip them so an entity cannot suppress its own
+            # alert by echoing the marker back.
+            payload = message[:self._WAKE_TEXT_MAX_CONTENT]
+            if len(message) > len(payload):
+                payload += "… [truncated]"
             for _marker in _GATEWAY_SILENCE_MARKERS:
-                if _marker and _marker in trimmed:
-                    trimmed = trimmed.replace(_marker, "[marker stripped]")
-            # The suffix states the reply contract: informational by default, and
-            # explicitly silent when there is nothing to do. Without it every
-            # injected event buys an acknowledgement reply — the gateway's
-            # NO_REPLY silence path only suppresses delivery if the model picks it.
-            # No source prefix here: the adapter's own state-change templates
-            # already open with "[Home Assistant] ", so adding one would double it.
+                if _marker and _marker in payload:
+                    payload = payload.replace(_marker, "[marker stripped]")
+
+            # Gateway-authored envelope: the event text plus the reply contract.
+            # Informational by default and explicitly silent when there is nothing
+            # to do — without this every event buys an acknowledgement reply, since
+            # the gateway's silence path only fires when the model chooses it.
             wake_text = (
-                f"{trimmed}\n"
+                f"{payload}\n"
                 "(cross-platform event delivery — informational unless action is "
                 "needed; reply NO_REPLY if there is nothing to do)"
             )
-            # Synthesize the internal event by hand: admit_internal_event's
-            # deliver_wake helper does not expose allow_gateway_control, and event
-            # text comes from outside the gateway, so it must stay conversational
-            # (run_inbound's plugin-injection events set the same pair).
-            from gateway.platforms.event import MessageEvent, MessageType
-            from gateway.wake import admit_internal_event
-            # Reuse the target session's own origin as the event source (run_inbound's
-            # plugin-injection events do the same) — always a fresh copy, so a
-            # downstream mutation of the event's source can never write back into
-            # the stored routing entry. SessionSource is a dataclass today;
-            # copy.copy covers a non-dataclass origin type if one ever appears.
+
             origin = entry.origin
             if dataclasses.is_dataclass(origin) and not isinstance(origin, type):
                 origin = dataclasses.replace(origin)
             else:
                 origin = copy.copy(origin)
+
+            from gateway.platforms.event import MessageEvent, MessageType
+            from gateway.wake import admit_internal_event
             synth_event = MessageEvent(
-                text=wake_text, message_type=MessageType.TEXT,
-                source=origin, internal=True,
-                allow_gateway_control=False,
+                text=wake_text, message_type=MessageType.TEXT, source=origin,
+                internal=True, allow_gateway_control=False,
                 metadata={
                     "gateway_session_key": entry.session_key,
                     "gateway_session_id": entry.session_id,
                     "hermes_cross_platform_delivery": True,
+                    "hermes_ha_entity_id": entity_id,
                 },
             )
-            budget_key = f"{target_platform.value}:{home.chat_id}"
-            if not self._consume_injection_budget(budget_key):
-                logger.warning(
-                    "[%s] Session injection budget exhausted for chat %s "
-                    "(> %d in %dm); delivering as broadcast instead",
-                    self.name, budget_key,
-                    self._INJECTIONS_PER_CHAT_PER_HOUR,
-                    self._INJECTION_WINDOW_SECONDS // 60,
-                )
-                return None  # caller falls back to broadcast
             await admit_internal_event(adapter, synth_event)
             logger.info(
-                "[%s] Session-integrated delivery injected into %s",
-                self.name, entry.session_key,
+                "[%s] HA event for %s injected into %s",
+                self.name, entity_id, entry.session_key,
             )
-            # Synthetic id: full hex (collision-safe); no external referent —
-            # the injected turn's own message ids live in the target session.
-            return SendResult(success=True, message_id=uuid.uuid4().hex)
+            return True
         except BaseException as e:
-            # BaseException, not Exception: asyncio.CancelledError is a BaseException
-            # (3.8+), and a shutdown-time cancellation during admit_internal_event must
-            # still degrade to broadcast, not escape send() and drop the alert — the
-            # broadcast leg below re-raises cancellation after its own fallback.
+            # BaseException, not Exception: asyncio.CancelledError (3.8+) must also
+            # degrade to the source-session path rather than escape and drop the
+            # event.
             logger.warning(
-                "[%s] Session-integrated delivery to '%s' failed (%s); "
-                "falling back to broadcast",
-                self.name, getattr(target_platform, "value", target_platform), e,
+                "[%s] Session integration for %s failed (%s); "
+                "delivering via the source session",
+                self.name, entity_id, e,
             )
-            return None
+            return False
 
     def _consume_injection_budget(self, budget_key: str) -> bool:
         """Rolling-window injection budget for one target CHAT.

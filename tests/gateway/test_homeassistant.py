@@ -1023,82 +1023,6 @@ def test_deliver_mode_invalid_falls_back_to_broadcast():
 
 
 @pytest.mark.asyncio
-async def test_handle_event_tags_chat_id_with_target_and_session_suffix():
-    """Production tag path: _handle_ha_event must emit a MessageEvent whose
-    source.chat_id carries the resolved target and the ;session suffix when
-    deliver_mode is session (and the plain target tag when broadcast)."""
-    from gateway.platforms.event import MessageEvent
-
-    # session mode
-    adapter = _make_session_mode_adapter(
-        watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
-    )
-    adapter.handle_message = AsyncMock()
-    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
-    adapter.handle_message.assert_called_once()
-    event = adapter.handle_message.call_args[0][0]
-    assert isinstance(event, MessageEvent)
-    assert event.source.chat_id == "ha_events:whatsapp;session"
-
-    # broadcast mode: target tag, no suffix
-    adapter_b = _make_session_mode_adapter(
-        watch_entities=["sensor.s"], deliver="whatsapp",
-    )
-    adapter_b.handle_message = AsyncMock()
-    await adapter_b._handle_ha_event(_make_event("sensor.s", "1", "2"))
-    event_b = adapter_b.handle_message.call_args[0][0]
-    assert event_b.source.chat_id == "ha_events:whatsapp"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_with_default_target_logs_warning(caplog):
-    """deliver_mode: session with the default target must log — session
-    integration has no target session to inject into when the target is
-    'homeassistant'."""
-    import logging
-
-    adapter = _make_session_mode_adapter(
-        watch_entities=["sensor.s"], deliver_mode="session",
-    )
-    adapter.handle_message = AsyncMock()
-    with caplog.at_level(logging.WARNING, logger="plugins.platforms.homeassistant.adapter"):
-        await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
-    adapter.handle_message.assert_called_once()
-    event = adapter.handle_message.call_args[0][0]
-    assert event.source.chat_id == "ha_events"  # plain local path
-    assert any("no effect with the default target" in r.message for r in caplog.records)
-
-
-@pytest.mark.asyncio
-async def test_session_mode_injects_internal_event_with_guards():
-    """Session mode: event reaches the target session via admit_internal_event with
-    internal=True and allow_gateway_control=False (untrusted text stays conversational)."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "portao opened")
-
-    assert result.success
-    # The injection must actually have happened — fail if handle_message was skipped.
-    assert wa.handled, "session mode must inject via admit_internal_event (handle_message)"
-    assert not wa.sent, "session mode must not double-deliver via broadcast"
-    event = wa.handled[0]
-    assert event.internal is True
-    assert event.allow_gateway_control is False
-    assert event.metadata["hermes_cross_platform_delivery"] is True
-    # Target is resolved deterministically from the home channel, not from the
-    # entry list: the key is derived for the chat, not chosen by recency.
-    assert event.metadata["gateway_session_key"] == "agent:main:whatsapp:group:G"
-    assert "portao opened" in event.text
-    # No duplicated source prefix: the adapter's own templates already open with it.
-    assert not event.text.startswith("[Home Assistant] [Home Assistant]")
-    assert event.source.chat_id == "G"
-
-
-@pytest.mark.asyncio
 async def test_session_mode_omitted_injection_fails_the_assertion():
     """Guard against vacuous tests: broadcast tag (no ;session) must NOT inject."""
     adapter = _make_session_mode_adapter(deliver="whatsapp")
@@ -1112,125 +1036,6 @@ async def test_session_mode_omitted_injection_fails_the_assertion():
     assert result.success
     assert not wa.handled, "broadcast mode must not inject"
     assert wa.sent, "broadcast mode must deliver via adapter.send"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_without_prior_session_creates_the_target():
-    """A chat with no session yet is not a dead end: the target is resolved
-    deterministically from the home channel (get_or_create_session), so the first
-    event lands in the chat's own session instead of falling back forever."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    store = _Store([])
-    runner = _Runner(wa, store)
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert wa.handled, "the chat's session must be created and receive the injection"
-    assert not wa.sent, "no broadcast needed once the target session exists"
-    assert store.created, "the target session was created deterministically"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_injection_not_accepted_falls_back_to_broadcast():
-    """admit_internal_event raises WakeNotAccepted when the adapter does not accept:
-    delivery must degrade to broadcast, never drop."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter(accept=False)
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert wa.handled  # injection was attempted
-    assert wa.sent  # and broadcast picked it up
-
-
-@pytest.mark.asyncio
-async def test_send_without_runner_falls_back_to_ha_notification(monkeypatch):
-    """Pre-existing guard, not session-specific: no runner at all → HA notification.
-    (The no-runner check fires before any session-mode code.)"""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    adapter.gateway_runner = None
-    monkeypatch.setattr(
-        HomeAssistantAdapter, "_send_ha_notification",
-        AsyncMock(return_value=SendResult(success=True, message_id="ha-1")),
-    )
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-    assert result.success and result.message_id == "ha-1"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_without_session_store_falls_back_to_broadcast(monkeypatch):
-    """Session-mode early guard: a runner without a session store must degrade to
-    broadcast delivery, not crash or drop the alert."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    runner.session_store = None  # guard fires before the store is touched
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert not wa.handled, "no store → no injection"
-    assert wa.sent, "no store → broadcast delivery"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_cancelled_error_during_injection_falls_back():
-    """asyncio.CancelledError is a BaseException (3.8+): a shutdown-time
-    cancellation during admit_internal_event must still degrade to broadcast —
-    the 'never a silent drop' contract holds for cancellation too."""
-    import asyncio
-
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-
-    class _CancellingAdapter(_RecordingAdapter):
-        async def handle_message(self, event):
-            self.handled.append(event)
-            raise asyncio.CancelledError()
-
-    wa = _CancellingAdapter()
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "event")
-
-    assert result.success
-    assert wa.handled, "injection was attempted and cancelled"
-    assert wa.sent, "cancellation during injection must fall back to broadcast"
-
-
-@pytest.mark.asyncio
-async def test_session_mode_wake_text_truncates_oversized_content():
-    """Entity state values can be arbitrarily large; the injected wake text is
-    bounded so one event cannot blow the target session's context budget."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    huge = "x" * (HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 5000)
-    result = await adapter.send("ha_events:whatsapp;session", huge)
-
-    assert result.success
-    assert wa.handled
-    text = wa.handled[0].text
-    assert len(text) < HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 200
-    # The truncation marker sits before the fixed envelope suffix.
-    assert "[truncated]" in text
-    assert text.endswith(
-        "(cross-platform event delivery — informational unless action is needed; "
-        "reply NO_REPLY if there is nothing to do)"
-    )
 
 
 @pytest.mark.asyncio
@@ -1254,22 +1059,6 @@ async def test_session_mode_with_default_target_logs_and_falls_back():
     assert result.message_id == "ha-fb"
 
 
-@pytest.mark.asyncio
-async def test_fallback_chain_broadcast_failure_reaches_ha_notification(monkeypatch):
-    """Fallback chain stage 2→3: when broadcast adapter.send raises, the HA
-    notification path takes over (the alert is never dropped)."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp")
-    wa = _RecordingAdapter()
-    wa.send = AsyncMock(side_effect=RuntimeError("platform down"))
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-    monkeypatch.setattr(
-        HomeAssistantAdapter, "_send_ha_notification",
-        AsyncMock(return_value=SendResult(success=True, message_id="ha-fb")),
-    )
-    result = await adapter.send("ha_events:whatsapp", "event")
-    assert result.message_id == "ha-fb"
 
 
 def dataclasses_replace_chat(origin, chat_id):
@@ -1278,132 +1067,6 @@ def dataclasses_replace_chat(origin, chat_id):
     return dataclasses.replace(origin, chat_id=chat_id)
 
 
-@pytest.mark.asyncio
-async def test_session_mode_injection_budget_degrades_to_broadcast():
-    """Each injected event buys a full agent turn in the target session, so the
-    adapter caps injections per session per rolling window. Past the cap the
-    delivery must degrade to broadcast — never dropped, never a silent no-op."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
-    # Under the cap: injections accepted, no broadcast.
-    for i in range(cap):
-        result = await adapter.send("ha_events:whatsapp;session", f"event {i}")
-        assert result.success
-    assert len(wa.handled) == cap, f"expected {cap} injections, got {len(wa.handled)}"
-    assert not wa.sent, "no broadcast while under the budget"
-
-    # Past the cap: broadcast takes over for the same session.
-    result = await adapter.send("ha_events:whatsapp;session", "over budget")
-    assert result.success
-    assert len(wa.handled) == cap, "no further injection past the cap"
-    assert wa.sent and wa.sent[-1][0] == "G", "over-budget delivery degrades to broadcast"
-
-
-@pytest.mark.asyncio
-async def test_injection_budget_window_expires():
-    """The budget is a rolling window, not a lifetime quota: entries older than
-    the window are pruned and the session becomes injectable again."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
-    window = HomeAssistantAdapter._INJECTION_WINDOW_SECONDS
-    stale = time.time() - window - 1  # just outside the window
-    adapter._injection_times["whatsapp:G"] = [stale] * cap
-
-    result = await adapter.send("ha_events:whatsapp;session", "after window")
-
-    assert result.success
-    assert wa.handled, "expired entries must not block injection"
-    assert not wa.sent, "no broadcast needed once the window rolled over"
-
-
-@pytest.mark.asyncio
-async def test_injected_envelope_states_silence_contract():
-    """The injected envelope must carry the reply contract (informational unless
-    action is needed; NO_REPLY otherwise) so the agent does not buy an
-    acknowledgement reply for every event — the gateway's silence path only
-    suppresses delivery when the model chooses a silence marker."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "portao aberto")
-
-    assert result.success and wa.handled
-    text = wa.handled[0].text
-    assert "informational unless action is needed" in text
-    assert "NO_REPLY" in text
-    # The silence marker the guidance names must be one the gateway actually honors.
-    from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
-    assert "NO_REPLY" in LIVE_GATEWAY_SILENT_MARKERS, (
-        "the envelope must name a marker the gateway's silence path recognizes"
-    )
-
-
-@pytest.mark.asyncio
-async def test_injection_budget_is_chat_scoped_not_session_scoped():
-    """The cap must bound a CHAT, not a session: group chats key one session per
-    participant, so a per-session budget would let N participants each spend a
-    full allowance against the same chat (N x cap agent turns/hour). Rotation of
-    the "most recent" session must not buy extra turns."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    # Two participants' sessions for the SAME chat; selector always picks the newer.
-    older = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
-    newer = _Entry("agent:main:whatsapp:group:G:u2", "G", updated_at=2)
-    store = _Store([older, newer])
-    runner = _Runner(wa, store)
-    _wire_session_mode(adapter, runner, runner.home())
-
-    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
-    # Spend the whole chat budget on whichever session is newest.
-    for i in range(cap):
-        await adapter.send("ha_events:whatsapp;session", f"event {i}")
-    assert len(wa.handled) == cap
-
-    # The OTHER participant becomes newest — the chat budget must already be spent.
-    older.updated_at = 99
-    result = await adapter.send("ha_events:whatsapp;session", "after rotation")
-
-    assert result.success
-    assert len(wa.handled) == cap, (
-        "rotating to another participant's session must not buy a fresh allowance"
-    )
-    assert wa.sent, "over-budget delivery degrades to broadcast"
-
-
-@pytest.mark.asyncio
-async def test_entity_content_with_silence_marker_is_stripped():
-    """Untrusted entity text containing a gateway silence marker ('NO_REPLY',
-    '[SILENT]') must not survive into the injected envelope: the agent could echo
-    the marker it just read, suppressing a real alert with no visible trace."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
-    wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
-    _wire_session_mode(adapter, runner, runner.home())
-
-    result = await adapter.send("ha_events:whatsapp;session", "sensor says NO_REPLY and [SILENT]")
-
-    assert result.success and wa.handled
-    text = wa.handled[0].text
-    payload = text.split("\n", 1)[0]  # the event line, before the contract suffix
-    assert "NO_REPLY" not in payload, "silence marker from entity text must be stripped"
-    assert "[SILENT]" not in payload
-    assert "[marker stripped]" in payload
-    # The contract suffix still names the marker intentionally (it instructs, not quotes).
-    assert "reply NO_REPLY if there is nothing to do" in text
 
 
 def test_deliver_mode_domain_override_precedence():
@@ -1418,22 +1081,194 @@ def test_deliver_mode_domain_override_precedence():
 
 
 @pytest.mark.asyncio
-async def test_injected_envelope_has_no_duplicate_source_prefix():
-    """The state-change text already opens with the source tag; the injection must
-    not add a second one (observed in production as '[Home Assistant] [Home ...')."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+async def test_handle_event_injects_the_event_not_a_reply(monkeypatch):
+    """Session mode must inject the EVENT at ingestion time so the agent reasons
+    inside the target session. Injecting the outbound reply instead (the previous
+    shape) moved a finished answer across platforms, ran the reasoning in the
+    source session, and cost a second agent turn per event."""
+    adapter = _make_session_mode_adapter(
+        watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
+    )
     wa = _RecordingAdapter()
-    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
-    runner = _Runner(wa, _Store([entry]))
+    store = _Store([])
+    runner = _Runner(wa, store)
     _wire_session_mode(adapter, runner, runner.home())
+    adapter.gateway_runner = runner
+    adapter._owner_profile = None
+    adapter._last_event_time.clear()
 
-    # A formatted state-change line, as the adapter's templates produce it.
-    formatted = "[Home Assistant] Portao da Garagem: changed from 'closed' to 'open'"
-    result = await adapter.send("ha_events:whatsapp;session", formatted)
+    # If the source-session path ran, it would call handle_message on the adapter.
+    adapter.handle_message = AsyncMock()
 
-    assert result.success and wa.handled
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    adapter.handle_message.assert_not_called()  # no source-session turn
+    assert wa.handled, "the event must be injected into the target session"
+    injected = wa.handled[0]
+    assert injected.internal is True
+    assert injected.allow_gateway_control is False
+    assert injected.metadata["hermes_ha_entity_id"] == "sensor.s"
+    # The injected text is the EVENT description, not an agent reply.
+    assert "sensor.s" in injected.text
+    assert "NO_REPLY" in injected.text  # reply contract present
+
+
+@pytest.mark.asyncio
+async def test_handle_event_falls_back_to_source_session_when_not_injectable(monkeypatch):
+    """When integration is impossible (no home channel), the event must still be
+    processed normally — the alert is never dropped."""
+    adapter = _make_session_mode_adapter(
+        watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
+    )
+    runner = _Runner(_RecordingAdapter(), _Store([]))
+    runner.config = type("C", (), {"get_home_channel": staticmethod(lambda p: None)})()
+    adapter.gateway_runner = runner
+    adapter._owner_profile = None
+    adapter.handle_message = AsyncMock()
+    adapter._last_event_time.clear()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    adapter.handle_message.assert_called_once()  # normal source-session path
+
+
+def test_state_change_templates_carry_no_source_prefix():
+    """The templates must not embed a source prefix: the gateway already prefixes
+    shared multi-user sessions, and injection wraps the text itself — embedding one
+    produced '[Home Assistant] [Home Assistant] ...' on every event."""
+    from plugins.platforms.homeassistant import adapter as _a
+
+    for name, tmpl in list(_a._DOMAIN_TEMPLATES.items()) + [("default", _a._DEFAULT_TEMPLATE)]:
+        assert "[Home Assistant]" not in tmpl, f"{name} template still embeds a prefix"
+
+
+# ---------------------------------------------------------------------------
+# Session-mode injection at the ingestion point (issue #35060 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _session_mode_ingest(monkeypatch, **extra):
+    """Wire an adapter for _handle_ha_event injection tests; returns (adapter, wa, store)."""
+    extra.setdefault("watch_entities", ["sensor.s"])
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session", **extra)
+    wa = _RecordingAdapter()
+    store = _Store([])
+    runner = _Runner(wa, store)
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.gateway_runner = runner
+    adapter._owner_profile = None
+    adapter._last_event_time.clear()
+    return adapter, wa, store
+
+
+@pytest.mark.asyncio
+async def test_injection_budget_degrades_to_source_session(monkeypatch):
+    """Past the per-chat budget the event must still be processed — via the normal
+    source-session path — never dropped and never injected."""
+    adapter, wa, store = _session_mode_ingest(monkeypatch)
+    adapter.handle_message = AsyncMock()
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
+
+    for i in range(cap):
+        adapter._last_event_time.clear()
+        await adapter._handle_ha_event(_make_event("sensor.s", str(i), str(i + 1)))
+    assert len(wa.handled) == cap, f"expected {cap} injections, got {len(wa.handled)}"
+
+    adapter._last_event_time.clear()
+    await adapter._handle_ha_event(_make_event("sensor.s", "x", "y"))
+    assert len(wa.handled) == cap, "no injection past the cap"
+    adapter.handle_message.assert_called()  # degraded to the source session
+
+
+def test_injection_budget_window_expires():
+    """Rolling window, not a lifetime quota: entries past the window are pruned."""
+    import time as _t
+
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    key = "whatsapp:G"
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
+    window = HomeAssistantAdapter._INJECTION_WINDOW_SECONDS
+    adapter._injection_times[key] = [_t.time() - window - 1] * cap
+
+    assert adapter._consume_injection_budget(key) is True, "expired entries must not block"
+
+
+@pytest.mark.asyncio
+async def test_injection_budget_is_chat_scoped():
+    """The budget key is the CHAT, not a session: group chats key one session per
+    participant, so a per-session cap would multiply by participant count."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
+    for _ in range(cap):
+        assert adapter._consume_injection_budget("whatsapp:G") is True
+    assert adapter._consume_injection_budget("whatsapp:G") is False
+    # A different chat has its own budget.
+    assert adapter._consume_injection_budget("whatsapp:OTHER") is True
+
+
+@pytest.mark.asyncio
+async def test_oversized_event_payload_is_truncated(monkeypatch):
+    """Entity state values can be arbitrarily large; the injected text is bounded."""
+    adapter, wa, store = _session_mode_ingest(monkeypatch)
+    huge = "x" * (HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 5000)
+    adapter._format_state_change = staticmethod(lambda *a, **k: huge)
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled
+    assert len(wa.handled[0].text) < HomeAssistantAdapter._WAKE_TEXT_MAX_CONTENT + 300
+    assert "[truncated]" in wa.handled[0].text
+
+
+@pytest.mark.asyncio
+async def test_event_content_with_silence_marker_is_stripped(monkeypatch):
+    """Untrusted entity text containing a gateway silence marker must not survive
+    into the injected envelope (the agent could echo it and suppress the alert)."""
+    adapter, wa, store = _session_mode_ingest(monkeypatch)
+    adapter._format_state_change = staticmethod(
+        lambda *a, **k: "sensor says NO_REPLY and [SILENT]"
+    )
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled
+    payload = wa.handled[0].text.split("\n", 1)[0]
+    assert "NO_REPLY" not in payload
+    assert "[SILENT]" not in payload
+    assert "[marker stripped]" in payload
+
+
+@pytest.mark.asyncio
+async def test_injected_envelope_states_silence_contract(monkeypatch):
+    """The envelope names the reply contract, and names a marker the gateway honors."""
+    adapter, wa, store = _session_mode_ingest(monkeypatch)
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled
     text = wa.handled[0].text
-    assert text.startswith("[Home Assistant] Portao da Garagem")
-    assert "[Home Assistant] [Home Assistant]" not in text
+    assert "informational unless action is needed" in text
+    assert "NO_REPLY" in text
+    from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
+    assert "NO_REPLY" in LIVE_GATEWAY_SILENT_MARKERS
 
 
+@pytest.mark.asyncio
+async def test_injection_not_accepted_degrades_to_source_session(monkeypatch):
+    """A rejected injection must not drop the event: the source-session path runs."""
+    adapter = _make_session_mode_adapter(
+        deliver="whatsapp", deliver_mode="session", watch_entities=["sensor.s"],
+    )
+    wa = _RecordingAdapter(accept=False)  # admit_internal_event will raise
+    store = _Store([])
+    runner = _Runner(wa, store)
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.gateway_runner = runner
+    adapter._owner_profile = None
+    adapter._last_event_time.clear()
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "injection was attempted"
+    adapter.handle_message.assert_called_once()  # degraded, not dropped
