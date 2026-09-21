@@ -617,6 +617,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # Freshness guard: injecting into a session nobody has watched in days
             # silently swallows the event. Only sessions active within the window
             # are candidates; older ones degrade to broadcast.
+            #
+            # Key-shape guard: the entry's key must match what the gateway would
+            # derive for this source TODAY. When grouping config changes (e.g.
+            # group_sessions_per_user flipped), older entries keep their pre-change
+            # keys; injecting through one is rejected downstream because the
+            # adapter re-derives the key from the source and finds a mismatch —
+            # which lands every delivery in broadcast. Filtering here keeps the
+            # selector honest under config changes instead of relying on the
+            # downstream rejection.
             candidates = [
                 e for e in store.list_sessions(active_minutes=self._SESSION_FRESHNESS_MINUTES)
                 if e.origin is not None
@@ -624,6 +633,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 and getattr(e.origin, "chat_id", None) == home.chat_id
                 and len(e.session_key.split(":")) > 1
                 and profile_from_session_key_namespace(e.session_key.split(":")[1]) == want_profile
+                and self._entry_key_matches_today(e)
             ]
             if not candidates:
                 logger.info(
@@ -652,8 +662,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # explicitly silent when there is nothing to do. Without it every
             # injected event buys an acknowledgement reply — the gateway's
             # NO_REPLY silence path only suppresses delivery if the model picks it.
+            # No source prefix here: the adapter's own state-change templates
+            # already open with "[Home Assistant] ", so adding one would double it.
             wake_text = (
-                f"[Home Assistant] {trimmed}\n"
+                f"{trimmed}\n"
                 "(cross-platform event delivery — informational unless action is "
                 "needed; reply NO_REPLY if there is nothing to do)"
             )
@@ -712,6 +724,38 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 self.name, getattr(target_platform, "value", target_platform), e,
             )
             return None
+
+    @staticmethod
+    def _entry_key_matches_today(entry) -> bool:
+        """True when *entry*'s key matches what the gateway derives for it now.
+
+        Grouping config (``group_sessions_per_user`` / ``thread_sessions_per_user``)
+        determines the key shape. Entries created under an older config keep their
+        old keys, and an injection through one is dropped downstream as a
+        derived-key mismatch — so every delivery would silently degrade to
+        broadcast. Re-deriving from the entry's OWN origin under the current
+        config is the exact test the adapter performs downstream, applied here so
+        the selector never picks an unusable entry.
+        """
+        try:
+            from gateway.session import build_session_key, profile_from_session_key_namespace
+            from gateway.config import load_gateway_config
+            _cfg = load_gateway_config()
+            namespace = entry.session_key.split(":")[1] if ":" in entry.session_key else "main"
+            profile = profile_from_session_key_namespace(namespace)
+            expected = build_session_key(
+                entry.origin,
+                group_sessions_per_user=getattr(_cfg, "group_sessions_per_user", True),
+                thread_sessions_per_user=getattr(_cfg, "thread_sessions_per_user", False),
+                profile=None if profile == "default" else profile,
+            )
+            return entry.session_key == expected
+        except (ImportError, AttributeError, TypeError, ValueError):
+            # Config/shape problems must not break delivery: accept the entry and let
+            # the downstream adapter reject a genuine mismatch. Deliberately narrow
+            # (not bare Exception): a NameError or logic error here is a bug that
+            # must surface, not silently degrade every delivery to broadcast.
+            return True
 
     def _consume_injection_budget(self, budget_key: str) -> bool:
         """Rolling-window injection budget for one target CHAT.

@@ -894,15 +894,20 @@ def _make_session_mode_adapter(**extra) -> HomeAssistantAdapter:
 
 
 class _Entry:
-    """Minimal SessionEntry stand-in for store fakes."""
+    """Minimal SessionEntry stand-in for store fakes.
 
-    def __init__(self, session_key, chat_id, updated_at=1):
+    ``user_id`` mirrors what the gateway stamps on the origin at ingress: pass
+    None for a chat whose grouping config is not per-user (the derived key then
+    carries no participant), or a participant id when it is.
+    """
+
+    def __init__(self, session_key, chat_id, updated_at=1, user_id="u1"):
         self.session_key = session_key
         self.session_id = session_key
         self.updated_at = updated_at
         self.origin = SessionSource(
             platform=Platform.WHATSAPP, chat_id=chat_id, chat_type="group",
-            user_id="u1", user_name="Tester",
+            user_id=user_id, user_name="Tester",
         )
 
 
@@ -1077,7 +1082,9 @@ async def test_session_mode_injects_internal_event_with_guards():
     assert event.allow_gateway_control is False
     assert event.metadata["hermes_cross_platform_delivery"] is True
     assert event.metadata["gateway_session_key"] == entry.session_key
-    assert "[Home Assistant] portao opened" in event.text
+    assert "portao opened" in event.text
+    # No duplicated source prefix: the adapter's own templates already open with it.
+    assert not event.text.startswith("[Home Assistant] [Home Assistant]")
     assert event.source.chat_id == "G"
 
 
@@ -1236,20 +1243,64 @@ async def test_session_mode_wake_text_truncates_oversized_content():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_selects_most_recent_session_for_chat():
-    """Owner-only selection: when several sessions exist for the chat (per-participant
-    group sessions), the most recently updated entry wins."""
+async def test_session_mode_ignores_stale_key_shape_entries(monkeypatch):
+    """Under a non-per-user grouping config, a chat has exactly ONE valid key
+    shape. An entry left over from before the config change keeps the old shape and
+    cannot be injected through (the adapter re-derives the key and drops the event
+    as a mismatch), so the selector must skip it — even when it is the newest — and
+    use the valid entry instead.
+
+    The ambient config is pinned explicitly: the suite's HERMES_HOME isolation
+    would otherwise leave load_gateway_config() at the default (per-user) grouping.
+    """
+    import gateway.config as _gc
+
+    class _Cfg:
+        group_sessions_per_user = False
+        thread_sessions_per_user = False
+
+    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg())
+
     adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
     wa = _RecordingAdapter()
-    older = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
-    newer = _Entry("agent:main:whatsapp:group:G:u2", "G", updated_at=2)
-    runner = _Runner(wa, _Store([older, newer]))
+    # Stale shape (participant suffix), NEWEST timestamp — must be skipped.
+    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
+    # Valid shape under the pinned config, older — must be chosen.
+    valid = _Entry("agent:main:whatsapp:group:G", "G", updated_at=1, user_id=None)
+    runner = _Runner(wa, _Store([stale, valid]))
     _wire_session_mode(adapter, runner, runner.home())
 
     await adapter.send("ha_events:whatsapp;session", "event")
 
-    assert wa.handled
-    assert wa.handled[0].metadata["gateway_session_key"] == newer.session_key
+    assert wa.handled, "the valid entry must receive the injection"
+    assert wa.handled[0].metadata["gateway_session_key"] == valid.session_key, (
+        "a newer stale-shape entry must not win over the valid entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_session_mode_degrades_when_only_stale_entries_exist(monkeypatch):
+    """With no valid-shape entry at all, delivery must degrade to broadcast rather
+    than inject through an entry the adapter will reject downstream."""
+    import gateway.config as _gc
+
+    class _Cfg:
+        group_sessions_per_user = False
+        thread_sessions_per_user = False
+
+    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg())
+
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
+    runner = _Runner(wa, _Store([stale]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert not wa.handled, "no valid entry → no injection"
+    assert wa.sent, "no valid entry → broadcast delivery"
 
 
 @pytest.mark.asyncio
@@ -1289,6 +1340,12 @@ async def test_fallback_chain_broadcast_failure_reaches_ha_notification(monkeypa
     )
     result = await adapter.send("ha_events:whatsapp", "event")
     assert result.message_id == "ha-fb"
+
+
+def dataclasses_replace_chat(origin, chat_id):
+    """Return a copy of *origin* pointing at *chat_id* (keeps the dataclass type)."""
+    import dataclasses
+    return dataclasses.replace(origin, chat_id=chat_id)
 
 
 @pytest.mark.asyncio
@@ -1428,3 +1485,51 @@ def test_deliver_mode_domain_override_precedence():
     )
     assert adapter.resolve_deliver_mode("zone.back_yard") == "session"
     assert adapter.resolve_deliver_mode("sensor.other") == "broadcast"
+
+
+@pytest.mark.asyncio
+async def test_injected_envelope_has_no_duplicate_source_prefix():
+    """The state-change text already opens with the source tag; the injection must
+    not add a second one (observed in production as '[Home Assistant] [Home ...')."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    # A formatted state-change line, as the adapter's templates produce it.
+    formatted = "[Home Assistant] Portao da Garagem: changed from 'closed' to 'open'"
+    result = await adapter.send("ha_events:whatsapp;session", formatted)
+
+    assert result.success and wa.handled
+    text = wa.handled[0].text
+    assert text.startswith("[Home Assistant] Portao da Garagem")
+    assert "[Home Assistant] [Home Assistant]" not in text
+
+
+@pytest.mark.asyncio
+async def test_stale_key_shape_entries_are_not_injection_candidates(monkeypatch):
+    """Entries whose session key no longer matches what the gateway derives today
+    (grouping config changed since they were created) must not be selected: an
+    injection through one is dropped downstream as a derived-key mismatch, which
+    would degrade every delivery to broadcast without a signal."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    # Pre-change key shape: participant appended (per_user was True).
+    stale = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=99)
+    runner = _Runner(wa, _Store([stale]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    # Current config: grouping is NOT per-user, so the derived key drops the participant.
+    class _Cfg:
+        group_sessions_per_user = False
+        thread_sessions_per_user = False
+
+    import gateway.config as _gc
+    monkeypatch.setattr(_gc, "load_gateway_config", lambda *a, **k: _Cfg(), raising=False)
+
+    result = await adapter.send("ha_events:whatsapp;session", "event")
+
+    assert result.success
+    assert not wa.handled, "stale-key-shape entry must not be injected through"
+    assert wa.sent, "it must degrade to broadcast instead"
