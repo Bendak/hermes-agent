@@ -675,12 +675,24 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 if _marker and _marker in payload:
                     payload = payload.replace(_marker, "[marker stripped]")
 
-            # Gateway-authored envelope: the event text plus the reply contract.
-            # Informational by default and explicitly silent when there is nothing
-            # to do — without this every event buys an acknowledgement reply, since
-            # the gateway's silence path only fires when the model chooses it.
+            # Gateway-authored envelope: source tag, the event text, and the reply
+            # contract.
+            #
+            # The source tag belongs HERE, not in the state-change templates. Two
+            # distinct audiences:
+            #   - the templates feed the source-session path, where the gateway
+            #     prefixes shared multi-user sessions with the sender name (HA
+            #     events arrive as user_name "Home Assistant"), so a tag in the
+            #     template produced "[Home Assistant] [Home Assistant] ...";
+            #   - this envelope is injected as internal=True, which the gateway does
+            #     NOT attribute — without the tag the agent in the target session
+            #     sees "[<owner>] <sensor> changed ..." and cannot tell a machine
+            #     event from the owner's own message.
+            # Informational by default and explicitly silent when there is nothing to
+            # do — without the contract every event buys an acknowledgement reply,
+            # since the gateway's silence path only fires when the model chooses it.
             wake_text = (
-                f"{payload}\n"
+                f"[Home Assistant] {payload}\n"
                 "(cross-platform event delivery — informational unless action is "
                 "needed; reply NO_REPLY if there is nothing to do)"
             )

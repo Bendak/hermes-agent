@@ -1247,6 +1247,12 @@ async def test_injected_envelope_states_silence_contract(monkeypatch):
 
     assert wa.handled
     text = wa.handled[0].text
+    # Source tag: the injected envelope is internal=True and the gateway does not
+    # attribute it, so the agent needs the tag to tell a machine event from the
+    # owner's own message in the target session.
+    assert text.startswith("[Home Assistant] "), (
+        "injected events must carry the source tag: nothing else attributes them"
+    )
     assert "informational unless action is needed" in text
     assert "NO_REPLY" in text
     from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
