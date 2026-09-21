@@ -4,6 +4,7 @@ Requires aiohttp, HASS_TOKEN (Long-Lived Access Token) and HASS_URL (default htt
 """
 
 import asyncio
+import copy
 import dataclasses
 import json
 import logging
@@ -43,6 +44,22 @@ def _domain_of(entity_id: str) -> str:
     return entity_id.split(".")[0] if "." in entity_id else ""
 
 
+def _gateway_silence_markers() -> tuple:
+    """Markers the gateway suppresses from delivery, longest first.
+
+    Read from the gateway's own set so the two can never drift; a local literal
+    would silently stop matching if the gateway's marker list changes.
+    """
+    try:
+        from gateway.response_filters import LIVE_GATEWAY_SILENT_MARKERS
+        return tuple(sorted(LIVE_GATEWAY_SILENT_MARKERS, key=len, reverse=True))
+    except Exception:
+        return ()
+
+
+_GATEWAY_SILENCE_MARKERS = _gateway_silence_markers()
+
+
 def _auth_headers(token: str) -> Dict[str, str]:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
@@ -73,10 +90,12 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     _WAKE_TEXT_MAX_CONTENT = 2000
     # Injection budget: each accepted injection triggers a full agent turn in the
     # target session, so an unbounded event stream (flapping sensors, busy zones)
-    # would saturate that session with turns and replies. At most this many
-    # injections per session per rolling hour; beyond it, deliveries degrade to
-    # broadcast (never dropped) with a warning.
-    _INJECTIONS_PER_SESSION_PER_HOUR = 12
+    # would saturate that chat with turns and replies. At most this many
+    # injections per CHAT per rolling hour (chat-scoped: group chats key one
+    # session per participant, so a per-session cap would multiply by
+    # participant count); beyond it, deliveries degrade to broadcast (never
+    # dropped) with a warning.
+    _INJECTIONS_PER_CHAT_PER_HOUR = 12
     _INJECTION_WINDOW_SECONDS = 3600
     """``state_changed`` -> MessageEvents with domain/entity filtering and per-entity cooldowns."""
 
@@ -230,8 +249,8 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         # Cooldown tracking: entity_id -> last_event_timestamp
         self._last_event_time: Dict[str, float] = {}
-        # Session-injection budget: session_key -> injection timestamps inside the
-        # rolling window (pruned on each decision, bounded by the cap).
+        # Injection budget: chat budget_key -> injection timestamps inside the
+        # rolling window (pruned on each decision; keys evicted when empty).
         self._injection_times: Dict[str, list] = {}
 
     def _next_id(self) -> int:
@@ -563,9 +582,21 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
         Returns a successful :class:`SendResult` when the injection was accepted,
         or ``None`` when the caller must fall back to broadcast delivery (no
-        prior session for the chat, store unavailable, authorization failed, or
-        the carrier rejected the event). Never raises — a session-mode delivery
-        must degrade, not drop the alert.
+        prior session for the chat, store unavailable, authorization failed,
+        budget exhausted, or the carrier rejected the event). Never raises — a
+        session-mode delivery must degrade, not drop the alert.
+
+        Contracts this method relies on:
+
+        * ``admit_internal_event`` signals acceptance by raising
+          (``WakeNotAccepted``) and returns cleanly on success. A future change
+          that reports failure via a return value instead would make this call
+          site claim success for a failed injection and skip the broadcast.
+        * Cancellation is deliberately converted into a broadcast rather than
+          re-raised: for alert delivery, degrading beats propagating, and the
+          broadcast leg honors cancellation in its own try/except. Callers that
+          need strict cooperative cancellation must not rely on this method to
+          propagate it.
         """
         try:
             store = getattr(self.gateway_runner, "session_store", None)
@@ -609,6 +640,14 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             trimmed = content[:self._WAKE_TEXT_MAX_CONTENT]
             if len(content) > len(trimmed):
                 trimmed += "… [truncated]"
+            # Entity values are untrusted text and may themselves contain a marker
+            # the gateway treats as silence ("NO_REPLY", "[SILENT]"). Left intact,
+            # such a value could make the agent "reply" with the marker it just read,
+            # suppressing a real alert with no user-visible trace. Strip known
+            # markers from the payload before wrapping it.
+            for _marker in _GATEWAY_SILENCE_MARKERS:
+                if _marker and _marker in trimmed:
+                    trimmed = trimmed.replace(_marker, "[marker stripped]")
             # The suffix states the reply contract: informational by default, and
             # explicitly silent when there is nothing to do. Without it every
             # injected event buys an acknowledgement reply — the gateway's
@@ -625,12 +664,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             from gateway.platforms.event import MessageEvent, MessageType
             from gateway.wake import admit_internal_event
             # Reuse the target session's own origin as the event source (run_inbound's
-            # plugin-injection events do the same). SessionSource is always a dataclass,
-            # so the replace() copy holds; if a non-dataclass origin type ever appears
-            # here, add an explicit shallow copy for it.
+            # plugin-injection events do the same) — always a fresh copy, so a
+            # downstream mutation of the event's source can never write back into
+            # the stored routing entry. SessionSource is a dataclass today;
+            # copy.copy covers a non-dataclass origin type if one ever appears.
             origin = entry.origin
             if dataclasses.is_dataclass(origin) and not isinstance(origin, type):
                 origin = dataclasses.replace(origin)
+            else:
+                origin = copy.copy(origin)
             synth_event = MessageEvent(
                 text=wake_text, message_type=MessageType.TEXT,
                 source=origin, internal=True,
@@ -641,12 +683,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     "hermes_cross_platform_delivery": True,
                 },
             )
-            if not self._consume_injection_budget(entry.session_key):
+            budget_key = f"{target_platform.value}:{home.chat_id}"
+            if not self._consume_injection_budget(budget_key):
                 logger.warning(
-                    "[%s] Session injection budget exhausted for %s "
+                    "[%s] Session injection budget exhausted for chat %s "
                     "(> %d in %dm); delivering as broadcast instead",
-                    self.name, entry.session_key,
-                    self._INJECTIONS_PER_SESSION_PER_HOUR,
+                    self.name, budget_key,
+                    self._INJECTIONS_PER_CHAT_PER_HOUR,
                     self._INJECTION_WINDOW_SECONDS // 60,
                 )
                 return None  # caller falls back to broadcast
@@ -670,22 +713,32 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             )
             return None
 
-    def _consume_injection_budget(self, session_key: str) -> bool:
-        """Rolling-window injection budget for one target session.
+    def _consume_injection_budget(self, budget_key: str) -> bool:
+        """Rolling-window injection budget for one target CHAT.
 
-        True (and records the injection) while the session is under the per-hour
+        Keyed on platform+chat, not on the session: group chats are keyed per
+        participant, so a per-session budget would let N participants each spend
+        a full allowance against the same chat (N x cap agent turns/hour). Keying
+        on the chat bounds the turns a chat can buy regardless of which
+        participant's session the selector picks.
+
+        True (and records the injection) while the chat is under the per-hour
         cap; False once reached, so the caller degrades to broadcast. In-memory
         only: the adapter lives for the gateway process, so a restart resets the
-        window rather than persisting a stale allowance.
+        window rather than persisting a stale allowance. Keys whose recorded
+        times have all aged out are removed rather than left as empty lists.
         """
         now = time.time()
         cutoff = now - self._INJECTION_WINDOW_SECONDS
-        recent = [t for t in self._injection_times.get(session_key, []) if t > cutoff]
-        if len(recent) >= self._INJECTIONS_PER_SESSION_PER_HOUR:
-            self._injection_times[session_key] = recent  # keep pruned state
+        recent = [t for t in self._injection_times.get(budget_key, []) if t > cutoff]
+        if len(recent) >= self._INJECTIONS_PER_CHAT_PER_HOUR:
+            if recent:
+                self._injection_times[budget_key] = recent
+            else:
+                self._injection_times.pop(budget_key, None)  # FIX 1: no dead keys
             return False
         recent.append(now)
-        self._injection_times[session_key] = recent
+        self._injection_times[budget_key] = recent
         return True
 
     def _target_home_channel(self, platform: Platform, profile: Optional[str]):

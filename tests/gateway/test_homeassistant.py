@@ -1302,7 +1302,7 @@ async def test_session_mode_injection_budget_degrades_to_broadcast():
     runner = _Runner(wa, _Store([entry]))
     _wire_session_mode(adapter, runner, runner.home())
 
-    cap = HomeAssistantAdapter._INJECTIONS_PER_SESSION_PER_HOUR
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
     # Under the cap: injections accepted, no broadcast.
     for i in range(cap):
         result = await adapter.send("ha_events:whatsapp;session", f"event {i}")
@@ -1327,10 +1327,10 @@ async def test_injection_budget_window_expires():
     runner = _Runner(wa, _Store([entry]))
     _wire_session_mode(adapter, runner, runner.home())
 
-    cap = HomeAssistantAdapter._INJECTIONS_PER_SESSION_PER_HOUR
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
     window = HomeAssistantAdapter._INJECTION_WINDOW_SECONDS
     stale = time.time() - window - 1  # just outside the window
-    adapter._injection_times[entry.session_key] = [stale] * cap
+    adapter._injection_times["whatsapp:G"] = [stale] * cap
 
     result = await adapter.send("ha_events:whatsapp;session", "after window")
 
@@ -1362,3 +1362,69 @@ async def test_injected_envelope_states_silence_contract():
     assert "NO_REPLY" in LIVE_GATEWAY_SILENT_MARKERS, (
         "the envelope must name a marker the gateway's silence path recognizes"
     )
+
+
+@pytest.mark.asyncio
+async def test_injection_budget_is_chat_scoped_not_session_scoped():
+    """The cap must bound a CHAT, not a session: group chats key one session per
+    participant, so a per-session budget would let N participants each spend a
+    full allowance against the same chat (N x cap agent turns/hour). Rotation of
+    the "most recent" session must not buy extra turns."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    # Two participants' sessions for the SAME chat; selector always picks the newer.
+    older = _Entry("agent:main:whatsapp:group:G:u1", "G", updated_at=1)
+    newer = _Entry("agent:main:whatsapp:group:G:u2", "G", updated_at=2)
+    store = _Store([older, newer])
+    runner = _Runner(wa, store)
+    _wire_session_mode(adapter, runner, runner.home())
+
+    cap = HomeAssistantAdapter._INJECTIONS_PER_CHAT_PER_HOUR
+    # Spend the whole chat budget on whichever session is newest.
+    for i in range(cap):
+        await adapter.send("ha_events:whatsapp;session", f"event {i}")
+    assert len(wa.handled) == cap
+
+    # The OTHER participant becomes newest — the chat budget must already be spent.
+    older.updated_at = 99
+    result = await adapter.send("ha_events:whatsapp;session", "after rotation")
+
+    assert result.success
+    assert len(wa.handled) == cap, (
+        "rotating to another participant's session must not buy a fresh allowance"
+    )
+    assert wa.sent, "over-budget delivery degrades to broadcast"
+
+
+@pytest.mark.asyncio
+async def test_entity_content_with_silence_marker_is_stripped():
+    """Untrusted entity text containing a gateway silence marker ('NO_REPLY',
+    '[SILENT]') must not survive into the injected envelope: the agent could echo
+    the marker it just read, suppressing a real alert with no visible trace."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+
+    result = await adapter.send("ha_events:whatsapp;session", "sensor says NO_REPLY and [SILENT]")
+
+    assert result.success and wa.handled
+    text = wa.handled[0].text
+    payload = text.split("\n", 1)[0]  # the event line, before the contract suffix
+    assert "NO_REPLY" not in payload, "silence marker from entity text must be stripped"
+    assert "[SILENT]" not in payload
+    assert "[marker stripped]" in payload
+    # The contract suffix still names the marker intentionally (it instructs, not quotes).
+    assert "reply NO_REPLY if there is nothing to do" in text
+
+
+def test_deliver_mode_domain_override_precedence():
+    """Domain-level override (watch_domains dict form) must apply when no
+    per-entity override exists — the middle tier of the precedence chain."""
+    adapter = _make_session_mode_adapter(
+        deliver="whatsapp",
+        watch_domains=[{"zone": {"deliver_mode": "session"}}],
+    )
+    assert adapter.resolve_deliver_mode("zone.back_yard") == "session"
+    assert adapter.resolve_deliver_mode("sensor.other") == "broadcast"
