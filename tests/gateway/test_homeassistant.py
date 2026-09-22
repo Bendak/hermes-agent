@@ -971,10 +971,11 @@ class _RecordingAdapter:
 class _Runner:
     """GatewayRunner stand-in: profile-scoped adapter + home channel + store."""
 
-    def __init__(self, adapter, store, home_chat_id="G"):
+    def __init__(self, adapter, store, home_chat_id="G", home_chat_type="group"):
         self._adapter = adapter
         self.session_store = store
         self.home_chat_id = home_chat_id
+        self.home_chat_type = home_chat_type
 
     def _authorization_adapter(self, platform, profile):
         return self._adapter
@@ -989,6 +990,9 @@ class _Runner:
     def home(self):
         class _h:
             chat_id = self.home_chat_id
+            chat_type = self.home_chat_type
+            thread_id = None
+            user_id = None
         return _h()
 
 
@@ -1023,19 +1027,119 @@ def test_deliver_mode_invalid_falls_back_to_broadcast():
 
 
 @pytest.mark.asyncio
+async def test_dm_home_channel_derives_matching_session_key():
+    """A DM home channel must produce the same session key a real inbound DM builds.
+
+    Regression for the derived-target mismatch: with no chat_type recorded, the
+    adapter used to substitute "group" and mint agent:<ns>:whatsapp:group:<id> —
+    a key no real DM message ever enters. The resolved key must byte-match
+    build_session_key for a real DM source on the same chat.
+    """
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:dm:447700900000", "447700900000")
+    runner = _Runner(wa, _Store([entry]), home_chat_id="447700900000", home_chat_type="dm")
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "injection was attempted"
+    injected_key = wa.handled[0].metadata["gateway_session_key"]
+    # The same key a real inbound DM message from that chat builds:
+    from gateway.session import SessionSource, build_session_key
+    real_key = build_session_key(SessionSource(
+        platform=Platform.WHATSAPP, chat_id="447700900000", chat_type="dm"))
+    assert injected_key == real_key == "agent:main:whatsapp:dm:447700900000"
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_chat_type_fails_closed_to_broadcast():
+    """An unresolvable chat shape must degrade to broadcast, never mint a session."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:telegram:unknown:weird", "weird")
+    runner = _Runner(wa, _Store([entry]), home_chat_id="weird", home_chat_type=None)
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert not wa.handled, "fail-closed: unknown chat shape must not inject"
+    assert adapter.handle_message.await_count == 1, "event must reach the source session"
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_group_jid_derives_chat_type_without_recorded_field():
+    """Env-seeded homes have chat_type=None; the WhatsApp JID format resolves it."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:1203@g.us", "1203@g.us")
+    runner = _Runner(wa, _Store([entry]), home_chat_id="1203@g.us", home_chat_type=None)
+    home = runner.home()
+    home.platform = Platform.WHATSAPP  # env-seeded homes carry the platform
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "JID format resolves the chat type"
+    injected_key = wa.handled[0].metadata["gateway_session_key"]
+    assert injected_key == "agent:main:whatsapp:group:1203@g.us"
+
+
+def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
+    """A budget slot is committed only after admission accepts; a check
+    (commit=False) leaves the window untouched."""
+    adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session")
+    monkeypatch.setattr(adapter, "_INJECTIONS_PER_CHAT_PER_HOUR", 1)
+    key = "whatsapp:G"
+    assert adapter._consume_injection_budget(key, commit=False) is True
+    # A check alone must not spend the slot:
+    assert adapter._consume_injection_budget(key, commit=False) is True
+    adapter._commit_injection_budget(key)
+    # Now the (patched) cap of 1 is reached:
+    assert adapter._consume_injection_budget(key, commit=False) is False
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_propagates_from_injection():
+    """Cancellation must propagate (the broadcast block's contract), not degrade."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    entry = _Entry("agent:main:whatsapp:group:G", "G")
+    runner = _Runner(wa, _Store([entry]))
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.handle_message = AsyncMock()
+
+    import asyncio as _aio
+    from unittest.mock import patch as _patch
+    async def _cancelled(*a, **k):
+        raise _aio.CancelledError()
+    with _patch("gateway.wake.admit_internal_event", _cancelled):
+        with pytest.raises(_aio.CancelledError):
+            await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+    # and the source-session path must NOT run on a cancelling task:
+    adapter.handle_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_session_mode_omitted_injection_fails_the_assertion():
-    """Guard against vacuous tests: broadcast tag (no ;session) must NOT inject."""
-    adapter = _make_session_mode_adapter(deliver="whatsapp")
+    """Guard against vacuous tests: broadcast mode must NOT inject.
+
+    Drives _handle_ha_event (the only injection caller) — send() has no injection
+    path, so asserting on send() cannot fail even if injection regresses."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp")
     wa = _RecordingAdapter()
     entry = _Entry("agent:main:whatsapp:group:G:u1", "G")
     runner = _Runner(wa, _Store([entry]))
     _wire_session_mode(adapter, runner, runner.home())
+    adapter.handle_message = AsyncMock()
 
-    result = await adapter.send("ha_events:whatsapp", "plain broadcast")
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
 
-    assert result.success
     assert not wa.handled, "broadcast mode must not inject"
-    assert wa.sent, "broadcast mode must deliver via adapter.send"
+    assert adapter.handle_message.await_count == 1, "broadcast must reach the source session"
 
 
 @pytest.mark.asyncio

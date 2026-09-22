@@ -91,8 +91,7 @@ _TRIGGERED = ("cleared", "triggered")  # binary_sensor wording, indexed by ``sta
 class HomeAssistantAdapter(BasePlatformAdapter):
     # Session-mode freshness window: only sessions active within this window are
     # injection candidates (stale/ended sessions fall back to broadcast).
-    _SESSION_FRESHNESS_MINUTES = 24 * 60
-    # Upper bound for event content injected into a target session's wake text.
+        # Upper bound for event content injected into a target session's wake text.
     _WAKE_TEXT_MAX_CONTENT = 2000
     # Injection budget: each accepted injection triggers a full agent turn in the
     # target session, so an unbounded event stream (flapping sensors, busy zones)
@@ -641,21 +640,35 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # grouping config. Never chosen by recency — an injected turn refreshes
             # a session's activity clock, so recency is self-perpetuating, and in a
             # per-participant group it selects someone else's thread.
+            #
+            # chat_type must be RESOLVED, not guessed. A wrong key mints a phantom
+            # session (get_or_create_session creates it) that no real message ever
+            # joins — the reply still lands in the chat via broadcast, so nothing
+            # looks broken, but the injected history is orphaned. Resolution order:
+            # the persisted field (set by /sethome), then platform chat-id formats,
+            # else fail closed to the source-session path.
+            home_chat_type = self._resolve_home_chat_type(home)
+            if home_chat_type is None:
+                logger.warning(
+                    "[%s] Cannot resolve chat type for home %s@%s; "
+                    "delivering via the source session",
+                    self.name, target_platform.value, home.chat_id,
+                )
+                return False
+
             from gateway.session import SessionSource
             want_profile = profile or "default"
             home_source = SessionSource(
                 platform=target_platform, chat_id=home.chat_id,
-                chat_type=getattr(home, "chat_type", None) or "group",
+                chat_type=home_chat_type,
                 thread_id=getattr(home, "thread_id", None) or None,
                 user_id=getattr(home, "user_id", None) or None,
                 profile=want_profile if want_profile != "default" else None,
             )
-            entry = store.get_or_create_session(home_source, touch_activity=False)
-
-            # Budget is per CHAT: group chats key one session per participant, so a
-            # per-session cap would multiply by participant count.
+            # Budget BEFORE session creation: a refused injection must not mint a
+            # routing entry, and the slot is only committed once admission accepts.
             budget_key = f"{target_platform.value}:{home.chat_id}"
-            if not self._consume_injection_budget(budget_key):
+            if not self._consume_injection_budget(budget_key, commit=False):
                 logger.warning(
                     "[%s] Session injection budget exhausted for chat %s "
                     "(> %d in %dm); delivering via the source session instead",
@@ -664,6 +677,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     self._INJECTION_WINDOW_SECONDS // 60,
                 )
                 return False
+            entry = store.get_or_create_session(home_source, touch_activity=False)
 
             # Entity values are untrusted and may contain a marker the gateway
             # treats as silence; strip them so an entity cannot suppress its own
@@ -716,15 +730,19 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 },
             )
             await admit_internal_event(adapter, synth_event)
+            self._commit_injection_budget(budget_key)
             logger.info(
                 "[%s] HA event for %s injected into %s",
                 self.name, entity_id, entry.session_key,
             )
             return True
-        except BaseException as e:
-            # BaseException, not Exception: asyncio.CancelledError (3.8+) must also
-            # degrade to the source-session path rather than escape and drop the
-            # event.
+        except asyncio.CancelledError:
+            # Shutdown cancellation must propagate, matching the broadcast block's
+            # contract ("cancellation still propagates") — swallowing it here would
+            # run target-adapter I/O on a cancelling task and can double-deliver the
+            # event via the source-session path.
+            raise
+        except Exception as e:
             logger.warning(
                 "[%s] Session integration for %s failed (%s); "
                 "delivering via the source session",
@@ -732,7 +750,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             )
             return False
 
-    def _consume_injection_budget(self, budget_key: str) -> bool:
+    def _consume_injection_budget(self, budget_key: str, *, commit: bool = True) -> bool:
         """Rolling-window injection budget for one target CHAT.
 
         Keyed on platform+chat, not on the session: group chats are keyed per
@@ -754,11 +772,57 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             if recent:
                 self._injection_times[budget_key] = recent
             else:
-                self._injection_times.pop(budget_key, None)  # FIX 1: no dead keys
+                self._injection_times.pop(budget_key, None)
             return False
+        if commit:
+            # commit=False (the pre-admission check) leaves the window untouched:
+            # a slot is only spent when admission actually accepts the event.
+            recent.append(now)
+            self._injection_times[budget_key] = recent
+        return True
+
+    def _commit_injection_budget(self, budget_key: str) -> None:
+        """Record one accepted injection against the chat's rolling window."""
+        now = time.time()
+        cutoff = now - self._INJECTION_WINDOW_SECONDS
+        recent = [t for t in self._injection_times.get(budget_key, []) if t > cutoff]
         recent.append(now)
         self._injection_times[budget_key] = recent
-        return True
+
+    @staticmethod
+    def _resolve_home_chat_type(home) -> Optional[str]:
+        """Resolve the home channel's chat type for session-key derivation, or None
+        when it cannot be resolved reliably (callers fail closed to broadcast).
+
+        Resolution order:
+        1. the persisted ``chat_type`` (recorded by /sethome);
+        2. platform chat-id formats (WhatsApp JIDs, Telegram numeric ids);
+        3. None — unknown shape; never guess, because a wrong key mints a phantom
+           session that no real message ever joins.
+        """
+        recorded = getattr(home, "chat_type", None)
+        if recorded:
+            return str(recorded)
+        chat_id = str(getattr(home, "chat_id", "") or "")
+        platform = getattr(home, "platform", None)
+        platform_value = getattr(platform, "value", None) or ""
+        if platform_value == "whatsapp":
+            # JIDs: "...@g.us" (and the @lid group form) are groups; user DMs end
+            # with "@s.whatsapp.net" (or a bare phone number for env-seeded homes).
+            if chat_id.endswith("@g.us") or chat_id.endswith("@lid"):
+                return "group"
+            if chat_id.endswith("@s.whatsapp.net") or chat_id.isdigit():
+                return "dm"
+            return None
+        if platform_value == "telegram":
+            # Supergroups/channels carry a -100 prefix; plain groups are negative;
+            # user DMs are positive numeric ids.
+            if chat_id.startswith("-"):
+                return "group"
+            if chat_id.isdigit():
+                return "dm"
+            return None
+        return None
 
     def _target_home_channel(self, platform: Platform, profile: Optional[str]):
         """Home channel for *platform* as seen by *profile* (the default's config when unset)."""
