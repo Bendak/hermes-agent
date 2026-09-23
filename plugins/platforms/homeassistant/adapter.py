@@ -656,7 +656,7 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                 )
                 return False
 
-            from gateway.session import SessionSource
+            from gateway.session import SessionSource, build_session_key
             want_profile = profile or "default"
             home_source = SessionSource(
                 platform=target_platform, chat_id=home.chat_id,
@@ -677,7 +677,20 @@ class HomeAssistantAdapter(BasePlatformAdapter):
                     self._INJECTION_WINDOW_SECONDS // 60,
                 )
                 return False
-            entry = store.get_or_create_session(home_source, touch_activity=False)
+            # Never-mint invariant: the derived key must match a session that a
+            # real message already built. lookup, not get_or_create - a wrong or
+            # unreachable derivation (unknown chat-id shape, a per-participant group
+            # key the home source cannot reproduce) then degrades to broadcast
+            # instead of minting an orphaned session no real message ever joins.
+            derived_key = build_session_key(home_source, group_sessions_per_user=True)
+            entry = store.lookup_by_session_key(derived_key)
+            if entry is None:
+                logger.warning(
+                    "[%s] No existing session for the derived home key (%s); "
+                    "delivering via broadcast instead of minting one",
+                    self.name, derived_key,
+                )
+                return False
 
             # Entity values are untrusted and may contain a marker the gateway
             # treats as silence; strip them so an entity cannot suppress its own
@@ -795,10 +808,16 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         when it cannot be resolved reliably (callers fail closed to broadcast).
 
         Resolution order:
-        1. the persisted ``chat_type`` (recorded by /sethome);
-        2. platform chat-id formats (WhatsApp JIDs, Telegram numeric ids);
-        3. None — unknown shape; never guess, because a wrong key mints a phantom
-           session that no real message ever joins.
+        1. the persisted ``chat_type`` (recorded by /sethome) - authoritative;
+        2. chat-id shapes that are UNAMBIGUOUS on the platform:
+           - WhatsApp: ``...@g.us`` -> group (the tree's own shape rule, channel_directory);
+             ``...@s.whatsapp.net`` or bare digits -> dm. ``@lid`` is a person alias
+             (whatsapp_identity: the bridge can surface one human as a LID or a phone
+             JID), NOT a group shape - never guessed here;
+           - Telegram: positive ids -> dm; a negative id separates dm from non-dm only
+             (a topic-enabled supergroup builds ``forum``, telegram adapter), so a
+             negative id is never guessed as ``group`` here;
+        3. None - unknown shape; the caller must not mint, it must check-or-broadcast.
         """
         recorded = getattr(home, "chat_type", None)
         if recorded:
@@ -807,21 +826,15 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         platform = getattr(home, "platform", None)
         platform_value = getattr(platform, "value", None) or ""
         if platform_value == "whatsapp":
-            # JIDs: "...@g.us" (and the @lid group form) are groups; user DMs end
-            # with "@s.whatsapp.net" (or a bare phone number for env-seeded homes).
-            if chat_id.endswith("@g.us") or chat_id.endswith("@lid"):
+            if chat_id.endswith("@g.us"):
                 return "group"
             if chat_id.endswith("@s.whatsapp.net") or chat_id.isdigit():
                 return "dm"
             return None
         if platform_value == "telegram":
-            # Supergroups/channels carry a -100 prefix; plain groups are negative;
-            # user DMs are positive numeric ids.
-            if chat_id.startswith("-"):
-                return "group"
-            if chat_id.isdigit():
+            if chat_id.isdigit() and not chat_id.startswith("-"):
                 return "dm"
-            return None
+            return None  # -... may be group, supergroup/forum, or channel: not derivable
         return None
 
     def _target_home_channel(self, platform: Platform, profile: Optional[str]):

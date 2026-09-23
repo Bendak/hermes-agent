@@ -901,7 +901,7 @@ class _Entry:
     carries no participant), or a participant id when it is.
     """
 
-    def __init__(self, session_key, chat_id, updated_at=1, user_id="u1"):
+    def __init__(self, session_key, chat_id, updated_at=1, user_id=None):
         self.session_key = session_key
         self.session_id = session_key
         self.updated_at = updated_at
@@ -918,6 +918,10 @@ class _Store:
     def __init__(self, entries):
         self._entries = entries
         self.created = []
+
+    def lookup_by_session_key(self, session_key):
+        """Return the persisted entry for an exact session key (None if unknown)."""
+        return next((e for e in self._entries if e.session_key == session_key), None)
 
     def list_sessions(self, active_minutes=None):
         return list(self._entries)
@@ -1000,6 +1004,16 @@ def _wire_session_mode(adapter, runner, home):
     adapter.gateway_runner = runner
     adapter._owner_profile = None
     runner.config.get_home_channel = staticmethod(lambda p, _h=home: _h)
+
+
+def _home_store(adapter_platform="whatsapp", chat_id="G", chat_type="group"):
+    """Store pre-populated with the home channel's derived session - the never-mint
+    contract requires the target session to already exist (a real message built it)."""
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    from gateway.config import Platform as _P
+    src = _SS(platform=getattr(_P, adapter_platform.upper()), chat_id=chat_id, chat_type=chat_type)
+    key = _bk(src, group_sessions_per_user=True)
+    return _Store([_Entry(key, chat_id)])
 
 
 def test_deliver_mode_defaults_to_broadcast():
@@ -1086,6 +1100,72 @@ async def test_whatsapp_group_jid_derives_chat_type_without_recorded_field():
     assert wa.handled, "JID format resolves the chat type"
     injected_key = wa.handled[0].metadata["gateway_session_key"]
     assert injected_key == "agent:main:whatsapp:group:1203@g.us"
+
+
+@pytest.mark.asyncio
+async def test_lid_home_without_recorded_field_degrades_to_broadcast():
+    """A WhatsApp ``@lid`` home is a person alias, not a group: with no recorded
+    ``chat_type`` the shape is unresolvable, so the adapter must broadcast rather
+    than mint ``...:group:<lid>`` (a key no real message on that chat enters)."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    store = _Store([])
+    runner = _Runner(wa, store, home_chat_id="999888777@lid", home_chat_type=None)
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert not wa.handled, "@lid without a recorded chat_type is not derivable"
+    assert adapter.handle_message.await_count == 1, "event must reach the source session"
+    assert store.created == [], "never mint: no session may be created for an unresolvable home"
+
+
+@pytest.mark.asyncio
+async def test_telegram_negative_id_home_without_recorded_field_degrades_to_broadcast():
+    """A Telegram negative id may build group, forum, or channel: the id does not
+    encode forum-ness, so with no recorded ``chat_type`` the adapter must not
+    guess ``group`` - it broadcasts."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="telegram", deliver_mode="session")
+    tg = _RecordingAdapter()
+    store = _Store([])
+    runner = _Runner(tg, store, home_chat_id="-1001234", home_chat_type=None)
+    home = runner.home()
+    home.platform = Platform.TELEGRAM
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert not tg.handled, "negative telegram id alone cannot prove ``group``"
+    assert store.created == [], "never mint on an ambiguous negative id"
+
+
+@pytest.mark.asyncio
+async def test_per_participant_group_home_broadcasts_instead_of_minting():
+    """With group_sessions_per_user, real group sessions carry a participant id in
+    the key. The home source has no participant, so its derived key cannot match
+    any member's session - lookup must fail and degrade to broadcast, never mint."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    # The store holds ONLY the member's real key (with participant), not the home's:
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    member_key = _bk(_SS(platform=Platform.WHATSAPP, chat_id="1203@g.us",
+                         chat_type="group", user_id="member1", user_name="M"))
+    store = _Store([_Entry(member_key, "1203@g.us")])
+    runner = _Runner(wa, store, home_chat_id="1203@g.us", home_chat_type="group")
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert not wa.handled, "the derived participant-less key matches no member session"
+    assert store.created == [], "never mint: no orphaned session for the home source"
+    assert adapter.handle_message.await_count == 1, "event reaches the source session"
 
 
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
@@ -1194,7 +1274,7 @@ async def test_handle_event_injects_the_event_not_a_reply(monkeypatch):
         watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
     )
     wa = _RecordingAdapter()
-    store = _Store([])
+    store = _home_store()
     runner = _Runner(wa, store)
     _wire_session_mode(adapter, runner, runner.home())
     adapter.gateway_runner = runner
@@ -1224,7 +1304,7 @@ async def test_handle_event_falls_back_to_source_session_when_not_injectable(mon
     adapter = _make_session_mode_adapter(
         watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session",
     )
-    runner = _Runner(_RecordingAdapter(), _Store([]))
+    runner = _Runner(_RecordingAdapter(), _home_store())
     runner.config = type("C", (), {"get_home_channel": staticmethod(lambda p: None)})()
     adapter.gateway_runner = runner
     adapter._owner_profile = None
@@ -1256,7 +1336,7 @@ def _session_mode_ingest(monkeypatch, **extra):
     extra.setdefault("watch_entities", ["sensor.s"])
     adapter = _make_session_mode_adapter(deliver="whatsapp", deliver_mode="session", **extra)
     wa = _RecordingAdapter()
-    store = _Store([])
+    store = _home_store()
     runner = _Runner(wa, store)
     _wire_session_mode(adapter, runner, runner.home())
     adapter.gateway_runner = runner
@@ -1370,7 +1450,7 @@ async def test_injection_not_accepted_degrades_to_source_session(monkeypatch):
         deliver="whatsapp", deliver_mode="session", watch_entities=["sensor.s"],
     )
     wa = _RecordingAdapter(accept=False)  # admit_internal_event will raise
-    store = _Store([])
+    store = _home_store()
     runner = _Runner(wa, store)
     _wire_session_mode(adapter, runner, runner.home())
     adapter.gateway_runner = runner
