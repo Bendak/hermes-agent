@@ -213,7 +213,7 @@ The `deliver` value is the name of any connected platform: `telegram`, `whatsapp
 On top of the `deliver` target, `deliver_mode` controls **how** the event reaches the target chat:
 
 - **`broadcast` (default)** — the event is sent to the target chat as a plain message. It appears in the chat, but does not enter that chat's conversation history (the agent turn runs in the Home Assistant session).
-- **`session`** — the event is injected into the target chat's most recent live session as an internal notification (`display_kind: internal_notification`), and a full agent turn runs **in that session**. Follow-ups in the target chat have the event in context, and the agent can act on it (validate state, escalate, archive). The synthetic event is marked `internal` with `allow_gateway_control: false`, so external event text can never resolve gateway commands — it stays conversational.
+- **`session`** — the event is injected into the target chat's existing session as an internal notification (`display_kind: internal_notification`), and a full agent turn runs **in that session**. Follow-ups in the target chat have the event in context, and the agent can act on it (validate state, escalate, archive). The synthetic event is marked `internal` with `allow_gateway_control: false`, so external event text can never resolve gateway commands — it stays conversational. Follow-ups in the target chat have the event in context, and the agent can act on it (validate state, escalate, archive). The synthetic event is marked `internal` with `allow_gateway_control: false`, so external event text can never resolve gateway commands — it stays conversational.
 
 ```yaml
 homeassistant:
@@ -231,11 +231,13 @@ Precedence matches `deliver` itself: per-entry override → top-level key → `b
 
 Behavior notes:
 
-- **Session selection is owner-only and profile-scoped**: the most recent session for the target chat **inside the adapter's own profile** receives the injection. No per-participant fan-out and no synthetic sessions are minted.
-- **No prior session for the chat** → the delivery degrades to `broadcast`.
+- **Target resolution**: the home channel's `chat_type` is resolved from the persisted field (set by `/sethome`) first, then from unambiguous chat-id shapes (WhatsApp `@g.us` → group; phone → DM); anything ambiguous — a WhatsApp `@lid` (a person alias, not a group), a Telegram negative id (may be a forum, not a plain group) — resolves to unknown. The adapter then derives the target session's key and **looks up an existing session**; it never creates one.
+- **Never mint**: if no persisted session matches the derived key — unknown shape, or a per-participant group key the home source cannot reproduce (`group_sessions_per_user: true`, the default, adds the sender's id to real group keys) — the delivery degrades to `broadcast` with a warning instead of creating a session no real message would ever join. Run `/sethome` in the target chat to pin its `chat_type` explicitly.
 - **Fallback chain (per stage)**: session injection → broadcast → HA persistent notification. An alert is never silently dropped.
+- **Rate limit**: at most 12 session injections per target chat per hour; excess events degrade to `broadcast` for the rest of the window.
 - **`deliver_mode: session` with the default target (`homeassistant`)** has no target session to integrate with: it logs a warning and delivers the HA notification.
-- Session mode consumes an agent turn in the target chat per delivered event — opt in explicitly when the conversational integration is worth the cost.
+- **Cost**: session mode consumes an agent turn in the target chat per delivered event — opt in explicitly when the conversational integration is worth the cost.
+- **Event coalescing**: Home Assistant may debounce rapid state flips (a door that opens and closes within seconds can emit only one side of the crossing). The delivered event may therefore be incomplete; the agent's recovery path is reading **live state** via its HA tools rather than trusting event completeness — configure alarm-style crossings with that in mind.
 
 ### Connection Management
 
