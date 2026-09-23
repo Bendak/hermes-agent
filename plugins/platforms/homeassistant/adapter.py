@@ -682,6 +682,10 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # unreachable derivation (unknown chat-id shape, a per-participant group
             # key the home source cannot reproduce) then degrades to broadcast
             # instead of minting an orphaned session no real message ever joins.
+            # group_sessions_per_user=True is deliberate: the home source carries no
+            # participant, so the participant slot is empty either way — but under the
+            # default (true) real member keys DO carry one, which is exactly why this
+            # lookup misses and the delivery degrades to broadcast.
             derived_key = build_session_key(home_source, group_sessions_per_user=True)
             entry = store.lookup_by_session_key(derived_key)
             if entry is None:

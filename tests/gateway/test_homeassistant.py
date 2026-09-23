@@ -1109,7 +1109,9 @@ async def test_lid_home_without_recorded_field_degrades_to_broadcast():
     than mint ``...:group:<lid>`` (a key no real message on that chat enters)."""
     adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
     wa = _RecordingAdapter()
-    store = _Store([])
+    # Pre-populate with the key the old @lid->group mutation would derive, so the
+    # resolver (not the empty-store lookup) is what the test pins:
+    store = _Store([_Entry("agent:main:whatsapp:group:999888777@lid", "999888777@lid")])
     runner = _Runner(wa, store, home_chat_id="999888777@lid", home_chat_type=None)
     home = runner.home()
     home.platform = Platform.WHATSAPP
@@ -1130,7 +1132,8 @@ async def test_telegram_negative_id_home_without_recorded_field_degrades_to_broa
     guess ``group`` - it broadcasts."""
     adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="telegram", deliver_mode="session")
     tg = _RecordingAdapter()
-    store = _Store([])
+    # Pre-populate with the key the old negative-id->group guess would derive:
+    store = _Store([_Entry("agent:main:telegram:group:-1001234", "-1001234")])
     runner = _Runner(tg, store, home_chat_id="-1001234", home_chat_type=None)
     home = runner.home()
     home.platform = Platform.TELEGRAM
