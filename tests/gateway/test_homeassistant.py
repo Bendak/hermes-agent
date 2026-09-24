@@ -1317,6 +1317,21 @@ async def test_session_mode_wire_passes_profile_to_derivation():
     assert injected == work_key == "agent:work:whatsapp:group:1203@g.us", injected
 
 
+def test_punctuated_silence_marker_stripped_like_matcher():
+    """Mutation pin for the edge-punctuation fold: ".NO_REPLY." survives the
+    gateway matcher as intentional silence, so the pre-injection strip must
+    remove it exactly like the matcher would - failing the test if the fold is
+    removed."""
+    from plugins.platforms.homeassistant.adapter import HomeAssistantAdapter as _H
+    out = _H._strip_canonical_marker("sensor says .NO_REPLY. now", "NO_REPLY")
+    assert ".NO_REPLY." not in out, out
+    assert "NO_REPLY" not in out.replace("[marker stripped]", ""), out
+    # exact form and case/whitespace variants still covered:
+    for variant in ("no_reply", "No_Reply", "NO  REPLY", "NO_REPLY"):
+        o2 = _H._strip_canonical_marker(f"echo {variant} end", "NO_REPLY")
+        assert "NO_REPLY" not in o2.replace("[marker stripped]", ""), (variant, o2)
+
+
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
     """A budget slot is committed only after admission accepts; a check
     (commit=False) leaves the window untouched."""
@@ -1372,11 +1387,15 @@ async def test_session_mode_omitted_injection_fails_the_assertion():
 
 
 @pytest.mark.asyncio
-async def test_session_mode_with_default_target_logs_and_falls_back():
+async def test_session_mode_with_default_target_logs_and_falls_back(caplog):
     """deliver_mode: session with the default target (homeassistant) has no target
-    session to integrate with: log + fall back to the HA notification path."""
-    adapter = _make_session_mode_adapter(deliver_mode="session")
-    # resolve target default = homeassistant → _handle_ha_event tags plain "ha_events"
+    session to integrate with: log + fall back to the HA notification path.
+
+    Mutation pin: driven through _handle_ha_event (where the warning lives), so
+    neutering the logger.warning call fails this test."""
+    import logging as _logging
+
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver_mode="session")
     assert adapter.resolve_deliver_target("sensor.s") == "homeassistant"
     monkeypatched = SendResult(success=True, message_id="ha-fb")
     orig = HomeAssistantAdapter._send_ha_notification
@@ -1386,10 +1405,14 @@ async def test_session_mode_with_default_target_logs_and_falls_back():
 
     HomeAssistantAdapter._send_ha_notification = fake_ha
     try:
-        result = await adapter.send("ha_events", "event")  # untagged = local path
+        with caplog.at_level(_logging.WARNING, logger="plugins.platforms.homeassistant.adapter"):
+            await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
     finally:
         HomeAssistantAdapter._send_ha_notification = orig
-    assert result.message_id == "ha-fb"
+    assert any(
+        "has no effect with the default" in rec.message and rec.levelno == _logging.WARNING
+        for rec in caplog.records
+    ), "default-target warning must fire on the _handle_ha_event path"
 
 
 

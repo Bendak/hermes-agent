@@ -83,11 +83,15 @@ _TRIGGERED = ("cleared", "triggered")  # binary_sensor wording, indexed by ``sta
 
 
 class HomeAssistantAdapter(BasePlatformAdapter):
-    # Session-mode targeting: only an ALREADY-PERSISTED routing entry for the
-    # derived key is an injection candidate (never mint; unknown or unmatched
-    # keys degrade to broadcast). No freshness filter is applied - the lookup
-    # matches entries of any age by design..
-        # Upper bound for event content injected into a target session's wake text.
+    """``state_changed`` -> MessageEvents with domain/entity filtering and per-entity cooldowns.
+
+    Session-mode targeting: only an ALREADY-PERSISTED routing entry for the
+    derived key is an injection candidate (never mint; unknown or unmatched
+    keys degrade to broadcast). No freshness filter is applied - the lookup
+    matches entries of any age by design.
+    """
+
+    # Upper bound for event content injected into a target session's wake text.
     _WAKE_TEXT_MAX_CONTENT = 2000
     # Injection budget: each accepted injection triggers a full agent turn in the
     # target session, so an unbounded event stream (flapping sensors, busy zones)
@@ -98,7 +102,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     # dropped) with a warning.
     _INJECTIONS_PER_CHAT_PER_HOUR = 12
     _INJECTION_WINDOW_SECONDS = 3600
-    """``state_changed`` -> MessageEvents with domain/entity filtering and per-entity cooldowns."""
 
     MAX_MESSAGE_LENGTH = 4096
     _BACKOFF_STEPS = [5, 10, 30, 60]  # reconnect backoff (seconds)
@@ -744,8 +747,13 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # Informational by default and explicitly silent when there is nothing to
             # do — without the contract every event buys an acknowledgement reply,
             # since the gateway's silence path only fires when the model chooses it.
+            # The upstream templates still carry a "[Home Assistant] " source tag
+            # (removing it is deliberately out of scope here - see the follow-up
+            # PR). Avoid double-tagging the injected text: only add the envelope
+            # tag when the payload does not already carry one.
+            _tagged = payload if payload.startswith("[Home Assistant] ") else f"[Home Assistant] {payload}"
             wake_text = (
-                f"[Home Assistant] {payload}\n"
+                f"{_tagged}\n"
                 "(cross-platform event delivery — informational unless action is "
                 "needed; reply NO_REPLY if there is nothing to do)"
             )
@@ -808,10 +816,9 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         cutoff = now - self._INJECTION_WINDOW_SECONDS
         recent = [t for t in self._injection_times.get(budget_key, []) if t > cutoff]
         if len(recent) >= self._INJECTIONS_PER_CHAT_PER_HOUR:
-            if recent:
-                self._injection_times[budget_key] = recent
-            else:
-                self._injection_times.pop(budget_key, None)
+            # len(recent) >= cap implies recent is non-empty; write back the
+            # aged-out-pruned window unconditionally.
+            self._injection_times[budget_key] = recent
             return False
         if commit:
             # commit=False (the pre-admission check) leaves the window untouched:
@@ -830,15 +837,23 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _strip_canonical_marker(payload: str, marker: str) -> str:
-        """Remove every substring whose canonical form equals the marker's.
+        """Remove every token whose canonical form equals the marker's.
 
-        Canonicalization mirrors response_filters._canonical_silence_candidate
-        (case-fold + whitespace collapse), so case variants ("no_reply",
-        "No_Reply") and whitespace variants are stripped along with the exact
-        form. Edge punctuation is deliberately NOT stripped here: the matcher
-        keeps brackets structural, and stripping them would rewrite unrelated
-        text.
+        Canonicalization mirrors response_filters's matcher: edge punctuation is
+        folded the same way _strip_edge_silence_punctuation folds it
+        (".NO_REPLY." -> "NO_REPLY"; brackets are structural and kept), then
+        case-fold + whitespace collapse, so case, whitespace and punctuated
+        variants are all stripped along with the exact form.
         """
+        import unicodedata
+
+        def _canon_token(word: str) -> str:
+            w = word
+            while w and w[0] not in "[]" and unicodedata.category(w[0]).startswith("P"):
+                w = w[1:]
+            while w and w[-1] not in "[]" and unicodedata.category(w[-1]).startswith("P"):
+                w = w[:-1]
+            return " ".join(w.upper().split())
         canon = " ".join(marker.strip().upper().split())
         if not canon:
             return payload
@@ -847,8 +862,8 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         out = []
         i = 0
         while i < len(words):
-            window = " ".join(words[i:i + target]).upper()
-            if window == canon and i + target <= len(words):
+            window = words[i:i + target]
+            if len(window) == target and " ".join(_canon_token(w) for w in window) == canon:
                 out.append("[marker stripped]")
                 i += target
             else:
