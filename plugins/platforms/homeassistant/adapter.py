@@ -658,11 +658,17 @@ class HomeAssistantAdapter(BasePlatformAdapter):
 
             from gateway.session import SessionSource, build_session_key
             want_profile = profile or "default"
+            # The home source deliberately carries NO participant: it must derive the
+            # SHARED chat's key (what any member's message would build), not the pinning
+            # user's. /sethome persists the operator's user_id on the channel; passing
+            # it here would append a participant slot and miss every real session key
+            # under group_sessions_per_user (either value). Same for thread_id: the
+            # thread of whoever ran /sethome is not the thread events belong in.
             home_source = SessionSource(
                 platform=target_platform, chat_id=home.chat_id,
                 chat_type=home_chat_type,
-                thread_id=getattr(home, "thread_id", None) or None,
-                user_id=getattr(home, "user_id", None) or None,
+                thread_id=None,
+                user_id=None,
                 profile=want_profile if want_profile != "default" else None,
             )
             # Budget BEFORE session creation: a refused injection must not mint a
@@ -682,11 +688,17 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             # unreachable derivation (unknown chat-id shape, a per-participant group
             # key the home source cannot reproduce) then degrades to broadcast
             # instead of minting an orphaned session no real message ever joins.
-            # group_sessions_per_user=True is deliberate: the home source carries no
-            # participant, so the participant slot is empty either way — but under the
-            # default (true) real member keys DO carry one, which is exactly why this
-            # lookup misses and the delivery degrades to broadcast.
-            derived_key = build_session_key(home_source, group_sessions_per_user=True)
+            # group_sessions_per_user mirrors the live config: under the default
+            # (true) real group keys carry the sender's participant, which the
+            # participant-less home key can never match - exactly the broadcast
+            # degradation the invariant prescribes. The namespace comes from the
+            # profile argument (build_session_key ignores source.profile).
+            derived_key = build_session_key(
+                home_source,
+                group_sessions_per_user=getattr(store.config, "group_sessions_per_user", True)
+                if getattr(store, "config", None) is not None else True,
+                profile=want_profile if want_profile != "default" else None,
+            )
             entry = store.lookup_by_session_key(derived_key)
             if entry is None:
                 logger.warning(

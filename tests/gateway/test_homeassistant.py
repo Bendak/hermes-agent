@@ -915,9 +915,10 @@ class _Store:
     """Session-store stand-in: list-based reads plus the deterministic
     get_or_create_session used by session-mode targeting."""
 
-    def __init__(self, entries):
+    def __init__(self, entries, config=None):
         self._entries = entries
         self.created = []
+        self.config = config
 
     def lookup_by_session_key(self, session_key):
         """Return the persisted entry for an exact session key (None if unknown)."""
@@ -1169,6 +1170,46 @@ async def test_per_participant_group_home_broadcasts_instead_of_minting():
     assert not wa.handled, "the derived participant-less key matches no member session"
     assert store.created == [], "never mint: no orphaned session for the home source"
     assert adapter.handle_message.await_count == 1, "event reaches the source session"
+
+
+@pytest.mark.asyncio
+async def test_home_with_pinned_user_id_derives_participant_less_key():
+    """Regression: /sethome persists the operator's user_id on the channel. The
+    derived key must NOT carry it - the home source must derive the shared chat
+    key, or the lookup misses every real session (per-user off) or pins to the
+    operator's private session (per-user on)."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    # The real shared key (per_user=false live config, no participant):
+    store = _Store([_Entry("agent:main:whatsapp:group:1203@g.us", "1203@g.us")],
+                   config=type("C", (), {"group_sessions_per_user": False})())
+    runner = _Runner(wa, store, home_chat_id="1203@g.us", home_chat_type="group")
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    home.user_id = "163728515449010@lid"  # what /sethome records
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "participant-less derived key must match the shared session"
+    injected_key = wa.handled[0].metadata["gateway_session_key"]
+    assert injected_key == "agent:main:whatsapp:group:1203@g.us", "no participant slot"
+    assert store.created == []
+
+
+def test_derived_key_namespace_follows_profile():
+    """build_session_key takes the namespace from the profile argument, not
+    source.profile: a named-profile home must derive agent:<profile>:..., matching
+    what that profile's sessions really build."""
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    from gateway.config import Platform as _P
+    src = _SS(platform=_P.WHATSAPP, chat_id="1203@g.us", chat_type="group", profile="work")
+    key = _bk(src, group_sessions_per_user=True, profile="work")
+    assert key.startswith("agent:work:whatsapp:group:"), key
+    # and the default profile stays agent:main:
+    src_d = _SS(platform=_P.WHATSAPP, chat_id="1203@g.us", chat_type="group", profile=None)
+    assert _bk(src_d, group_sessions_per_user=True).startswith("agent:main:")
 
 
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
