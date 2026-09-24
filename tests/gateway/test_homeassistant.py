@@ -1,4 +1,3 @@
-
 """Tests for the Home Assistant gateway adapter.
 
 Tests real logic: state change formatting, event filtering pipeline,
