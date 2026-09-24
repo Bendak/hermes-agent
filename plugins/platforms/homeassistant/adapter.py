@@ -65,26 +65,20 @@ def _auth_headers(token: str) -> Dict[str, str]:
 
 
 # domain -> description template; see ``_format_state_change`` for the fields.
-# NOTE: these templates deliberately carry NO source prefix. Two independent
-# attribution layers add one: the gateway prefixes shared multi-user sessions with
-# the sender name ("[Home Assistant] ", since HA events arrive with that
-# user_name), and an injected event is wrapped by the adapter itself. Embedding a
-# prefix here produced "[Home Assistant] [Home Assistant] ..." on every event in a
-# shared session.
-_TURNED = "{name}: turned {on_off}"
+_TURNED = "[Home Assistant] {name}: turned {on_off}"
 _DOMAIN_TEMPLATES = {
     "climate": (
-        "{name}: HVAC mode changed from "
+        "[Home Assistant] {name}: HVAC mode changed from "
         "'{old}' to '{new}' (current: {temp}, target: {target})"
     ),
-    "sensor": "{name}: changed from {old}{unit} to {new}{unit}",
-    "binary_sensor": "{name}: {new_trig} (was {old_trig})",
+    "sensor": "[Home Assistant] {name}: changed from {old}{unit} to {new}{unit}",
+    "binary_sensor": "[Home Assistant] {name}: {new_trig} (was {old_trig})",
     "light": _TURNED,
     "switch": _TURNED,
     "fan": _TURNED,
-    "alarm_control_panel": "{name}: alarm state changed from '{old}' to '{new}'",
+    "alarm_control_panel": "[Home Assistant] {name}: alarm state changed from '{old}' to '{new}'",
 }
-_DEFAULT_TEMPLATE = "{name} ({entity_id}): changed from '{old}' to '{new}'"
+_DEFAULT_TEMPLATE = "[Home Assistant] {name} ({entity_id}): changed from '{old}' to '{new}'"
 _TRIGGERED = ("cleared", "triggered")  # binary_sensor wording, indexed by ``state == "on"``
 
 

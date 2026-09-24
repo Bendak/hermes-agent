@@ -1,4 +1,3 @@
-
 ---
 title: Home Assistant
 description: Control your smart home with Hermes Agent via Home Assistant integration.

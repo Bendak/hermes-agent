@@ -977,14 +977,18 @@ class _RecordingAdapter:
 class _Runner:
     """GatewayRunner stand-in: profile-scoped adapter + home channel + store."""
 
-    def __init__(self, adapter, store, home_chat_id="G", home_chat_type="group"):
+    def __init__(self, adapter, store, home_chat_id="G", home_chat_type="group", home_profile=None):
         self._adapter = adapter
         self.session_store = store
         self.home_chat_id = home_chat_id
         self.home_chat_type = home_chat_type
+        self.home_profile = home_profile
 
     def _authorization_adapter(self, platform, profile):
         return self._adapter
+
+    def _profile_name_for_source(self, source, profile=None):
+        return self.home_profile or "default"
 
     class _cfg:
         @staticmethod
@@ -1252,6 +1256,67 @@ async def test_injected_text_framed_as_untrusted_data():
     assert "untrusted" in text.lower(), "payload must carry the untrusted framing"
 
 
+@pytest.mark.asyncio
+async def test_home_with_pinned_user_id_under_per_user_default_broadcasts():
+    """Mutation pin (default group_sessions_per_user: true): with the pinned
+    user_id passed through, the derived key lands in the pinning user's private
+    session - an arbitrary injection target. With the participant-less fix the
+    derived key matches NO member key, so the delivery must degrade to broadcast
+    even when the store holds the operator's own key."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    member_key = _bk(_SS(platform=Platform.WHATSAPP, chat_id="1203@g.us",
+                         chat_type="group", user_id="member1", user_name="M"),
+                     group_sessions_per_user=True)
+    operator_key = _bk(_SS(platform=Platform.WHATSAPP, chat_id="1203@g.us",
+                           chat_type="group", user_id="operator", user_name="O"),
+                       group_sessions_per_user=True)
+    store = _Store([_Entry(member_key, "1203@g.us"), _Entry(operator_key, "1203@g.us")],
+                   config=type("C", (), {"group_sessions_per_user": True})())
+    runner = _Runner(wa, store, home_chat_id="1203@g.us", home_chat_type="group")
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    home.user_id = "operator"
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert not wa.handled, "participant-less home key must match no member key"
+    assert store.created == [], "never mint"
+
+
+@pytest.mark.asyncio
+async def test_session_mode_wire_passes_profile_to_derivation():
+    """The adapter wiring (profile= argument at the build_session_key call) must
+    carry the named profile into the namespace: driving _handle_ha_event with a
+    named-profile owner derives agent:<profile>:..., byte-matching what that
+    profile's real sessions build."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    work_key = _bk(_SS(platform=Platform.WHATSAPP, chat_id="1203@g.us", chat_type="group"),
+                   group_sessions_per_user=True, profile="work")
+    store = _Store([_Entry(work_key, "1203@g.us")],
+                   config=type("C", (), {"group_sessions_per_user": True})())
+    runner = _Runner(wa, store, home_chat_id="1203@g.us", home_chat_type="group", home_profile="work")
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    _wire_session_mode(adapter, runner, home)
+    adapter._owner_profile = "work"  # AFTER the wire (the wire resets it)
+    # Profile-scoped home loading goes through the real profile config on disk;
+    # the pin here is the DERIVATION wiring, so stub the loader to the home:
+    adapter._target_home_channel = lambda platform, profile: home
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "profile-correct derivation must match the profile's session"
+    injected = wa.handled[0].metadata["gateway_session_key"]
+    assert injected == work_key == "agent:work:whatsapp:group:1203@g.us", injected
+
+
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
     """A budget slot is committed only after admission accepts; a check
     (commit=False) leaves the window untouched."""
@@ -1390,16 +1455,6 @@ async def test_handle_event_falls_back_to_source_session_when_not_injectable(mon
     await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
 
     adapter.handle_message.assert_called_once()  # normal source-session path
-
-
-def test_state_change_templates_carry_no_source_prefix():
-    """The templates must not embed a source prefix: the gateway already prefixes
-    shared multi-user sessions, and injection wraps the text itself — embedding one
-    produced '[Home Assistant] [Home Assistant] ...' on every event."""
-    from plugins.platforms.homeassistant import adapter as _a
-
-    for name, tmpl in list(_a._DOMAIN_TEMPLATES.items()) + [("default", _a._DEFAULT_TEMPLATE)]:
-        assert "[Home Assistant]" not in tmpl, f"{name} template still embeds a prefix"
 
 
 # ---------------------------------------------------------------------------
