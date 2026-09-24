@@ -1,3 +1,4 @@
+
 """Tests for the Home Assistant gateway adapter.
 
 Tests real logic: state change formatting, event filtering pipeline,
@@ -1212,6 +1213,45 @@ def test_derived_key_namespace_follows_profile():
     assert _bk(src_d, group_sessions_per_user=True).startswith("agent:main:")
 
 
+def test_silence_marker_stripped_regardless_of_case_or_whitespace():
+    """The gateway's silence matcher canonicalizes (case-fold + whitespace
+    collapse); the pre-injection strip must catch the same variants, or an
+    entity could echo "no_reply"/"NO_REPLY " and suppress its own alert."""
+    import types as _types
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    strip = adapter._strip_canonical_marker
+    for variant, marker in (
+        ("NO_REPLY", "NO_REPLY"), ("no_reply", "NO_REPLY"), ("No_Reply", "NO_REPLY"),
+        ("NO  REPLY", "NO REPLY"), ("NO\tREPLY", "NO REPLY"), ("no reply", "NO REPLY"),
+    ):
+        out = strip(f"sensor says {variant} now", marker)
+        assert "[marker stripped]" in out, f"{variant!r} survived: {out!r}"
+        assert variant not in out, f"{variant!r} survived: {out!r}"
+    # prose mentioning the marker inline is NOT a silence candidate for the
+    # matcher (it is not marker-sized), but the strip still removes the bare
+    # token - acceptable asymmetry: over-stripping an entity's prose is safe,
+    # under-stripping lets the entity silence its own alert.
+
+
+@pytest.mark.asyncio
+async def test_injected_text_framed_as_untrusted_data():
+    """The entity-derived payload must be framed as data (untrusted, not an
+    instruction) so a malicious entity state cannot pose as an instruction to
+    the agent's tool-using turn."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    store = _home_store()
+    runner = _Runner(wa, store, home_chat_id="G", home_chat_type="group")
+    _wire_session_mode(adapter, runner, runner.home())
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "injection attempted"
+    text = wa.handled[0].text
+    assert "untrusted" in text.lower(), "payload must carry the untrusted framing"
+
+
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
     """A budget slot is committed only after admission accepts; a check
     (commit=False) leaves the window untouched."""
@@ -1285,14 +1325,6 @@ async def test_session_mode_with_default_target_logs_and_falls_back():
     finally:
         HomeAssistantAdapter._send_ha_notification = orig
     assert result.message_id == "ha-fb"
-
-
-
-
-def dataclasses_replace_chat(origin, chat_id):
-    """Return a copy of *origin* pointing at *chat_id* (keeps the dataclass type)."""
-    import dataclasses
-    return dataclasses.replace(origin, chat_id=chat_id)
 
 
 
