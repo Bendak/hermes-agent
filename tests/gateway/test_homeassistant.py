@@ -1353,7 +1353,7 @@ async def test_injected_wake_text_carries_exactly_one_source_tag():
 
     await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
 
-    assert wa.handled, "shared key under per-user=false must match"
+    assert wa.handled, "shared key under per-user=true must match"
     text = wa.handled[0].text
     count = text.count("[Home Assistant]")
     assert count == 1, f"expected exactly 1 source tag, got {count}: {text[:220]}"

@@ -813,8 +813,8 @@ class HomeAssistantAdapter(BasePlatformAdapter):
         True (and records the injection) while the chat is under the per-hour
         cap; False once reached, so the caller degrades to broadcast. In-memory
         only: the adapter lives for the gateway process, so a restart resets the
-        window rather than persisting a stale allowance. Keys whose recorded
-        times have all aged out are removed rather than left as empty lists.
+        window rather than persisting a stale allowance. Aged timestamps are
+        filtered at read time; keys are never removed.
         """
         now = time.time()
         cutoff = now - self._INJECTION_WINDOW_SECONDS
