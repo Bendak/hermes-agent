@@ -1332,6 +1332,33 @@ def test_punctuated_silence_marker_stripped_like_matcher():
         assert "NO_REPLY" not in o2.replace("[marker stripped]", ""), (variant, o2)
 
 
+@pytest.mark.asyncio
+async def test_injected_wake_text_carries_exactly_one_source_tag():
+    """Mutation pin for the double-tag guard: the upstream templates still carry
+    a '[Home Assistant] ' source tag and the envelope adds its own; the guard
+    must detect the template tag on the RAW payload (before the untrusted
+    framing prefix) and inject exactly one source tag."""
+    adapter = _make_session_mode_adapter(watch_entities=["sensor.s"], deliver="whatsapp", deliver_mode="session")
+    wa = _RecordingAdapter()
+    from gateway.session import SessionSource as _SS, build_session_key as _bk
+    shared_key = _bk(_SS(platform=Platform.WHATSAPP, chat_id="1203@g.us", chat_type="group"),
+                     group_sessions_per_user=True)
+    store = _Store([_Entry(shared_key, "1203@g.us")],
+                   config=type("C", (), {"group_sessions_per_user": True})())
+    runner = _Runner(wa, store, home_chat_id="1203@g.us", home_chat_type="group")
+    home = runner.home()
+    home.platform = Platform.WHATSAPP
+    _wire_session_mode(adapter, runner, home)
+    adapter.handle_message = AsyncMock()
+
+    await adapter._handle_ha_event(_make_event("sensor.s", "0", "1"))
+
+    assert wa.handled, "shared key under per-user=false must match"
+    text = wa.handled[0].text
+    count = text.count("[Home Assistant]")
+    assert count == 1, f"expected exactly 1 source tag, got {count}: {text[:220]}"
+
+
 def test_injection_budget_slot_spent_only_on_admission(monkeypatch):
     """A budget slot is committed only after admission accepts; a check
     (commit=False) leaves the window untouched."""
@@ -1587,9 +1614,15 @@ async def test_injected_envelope_states_silence_contract(monkeypatch):
     text = wa.handled[0].text
     # Source tag: the injected envelope is internal=True and the gateway does not
     # attribute it, so the agent needs the tag to tell a machine event from the
-    # owner's own message in the target session.
-    assert text.startswith("[Home Assistant] "), (
-        "injected events must carry the source tag: nothing else attributes them"
+    # owner's own message in the target session. The untrusted-framing prefix
+    # comes first by design; the source tag appears exactly once (the double-tag
+    # guard detects the template tag on the RAW payload, before framing).
+    assert text.startswith("entity value (untrusted"), (
+        "the untrusted framing must come first"
+    )
+    assert text.count("[Home Assistant]") == 1, (
+        "injected events must carry the source tag exactly once: "
+        "nothing else attributes them"
     )
     assert "informational unless action is needed" in text
     assert "NO_REPLY" in text
